@@ -5,11 +5,14 @@
 // extracted from pkg/clouds/{yandex,pulumi/yandex} per the Phase 3 extraction
 // in forge/docs/design/2026-10-24/sc-plugin-architecture/.
 //
-// V1 scope: registrar surface (type `yc-dns`) only. Follow-ups add:
-//   - pulumi:providers:yandex (Provider RPC)
-//   - yc-bucket (Provision + ComputeProcess)
-//   - yc-serverless-container (Provision)
-//   - yc-object-storage state store (InitStateStore)
+// V2 scope — the full in-tree yandex surface:
+//   - pulumi:providers:yandex                 (Provider RPC)
+//   - yc-dns registrar                        (ProvisionRegistrar + NewDnsRecord +
+//                                              NewOverrideHeaderRule +
+//                                              ProvisionDomainForEndpoint)
+//   - yc-bucket                               (Provision + ComputeProcess)
+//   - yc-serverless-container                 (Provision)
+//   - yc-object-storage state store           (InitStateStore)
 //
 // Each RPC opens a short-lived pulumi.Context against the host's monitor
 // address and reuses the lifted internal/*.go driver code unchanged — the
@@ -21,6 +24,8 @@ import (
 	"fmt"
 	"os"
 	"sync"
+
+	"gopkg.in/yaml.v3"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
@@ -46,8 +51,12 @@ type ycPlugin struct {
 
 func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
-		PluginVersion:  "yandex-0.0.1",
-		RegistrarTypes: []string{ycApi.RegistrarTypeYandexDns},
+		PluginVersion:         "yandex-0.0.2",
+		StateStoreTypes:       []string{ycApi.StateStorageTypeYandexObjectStorage},
+		ProviderTypes:         []string{ycApi.ProviderType},
+		RegistrarTypes:        []string{ycApi.RegistrarTypeYandexDns},
+		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer},
+		ComputeProcessorTypes: []string{ycApi.ResourceTypeObjectStorageBucket},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
 			// terraform-provider-yandex (pulumi/pulumi-yandex is archived at v0.13.0).
@@ -187,6 +196,167 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 	urn := waitForRef(out.Ref)
 	p.progress.Info("endpoint", fmt.Sprintf("endpoint %q bound (urn=%s)", endpoint.Name, urn))
 	return &scpluginv1.ProvisionDomainForEndpointResponse{Urn: urn}, nil
+}
+
+// Provider — register the explicit pulumi:providers:yandex resource
+// against the shared Pulumi monitor. SC core records the returned URN
+// and threads it into every downstream Provision call via
+// RequestHeader.provider_urns.
+func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (*scpluginv1.ProviderResponse, error) {
+	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	var acct ycApi.AccountConfig
+	if err := decodeInputsAs(req.GetInputs(), &acct); err != nil {
+		return nil, errors.Wrap(err, "decode provider auth config")
+	}
+	input := api.ResourceInput{
+		Descriptor: &api.ResourceDescriptor{
+			Type:   ycApi.ProviderType,
+			Name:   req.GetProviderResourceName(),
+			Config: api.Config{Config: &acct},
+		},
+		StackParams: &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()},
+	}
+	p.progress.Info("provider", fmt.Sprintf("initialising yandex provider %q (folder=%q)", req.GetProviderResourceName(), acct.FolderID))
+	out, err := ycInternal.Provider(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
+	if err != nil {
+		p.progress.Error("provider", fmt.Sprintf("provider init failed: %v", err))
+		return nil, errors.Wrap(err, "init yandex provider")
+	}
+	urn := waitForRef(out.Ref)
+	p.progress.Info("provider", fmt.Sprintf("provider %q ready (urn=%s)", req.GetProviderResourceName(), urn))
+	return &scpluginv1.ProviderResponse{ProviderUrn: urn}, nil
+}
+
+// Provision — dispatch to the lifted bucket / serverless-container
+// driver based on resource_type. The sidecar on SC core routes types
+// advertised in Schema.resource_types here.
+func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
+	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	stack := api.Stack{Name: req.GetHeader().GetStackName()}
+	stackParams := &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()}
+	switch req.GetResourceType() {
+	case ycApi.ResourceTypeObjectStorageBucket:
+		var bucket ycApi.ObjectStorageBucket
+		if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
+			return nil, errors.Wrap(err, "decode bucket config")
+		}
+		input := api.ResourceInput{
+			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &bucket}},
+			StackParams: stackParams,
+		}
+		p.progress.Info("bucket", fmt.Sprintf("provisioning object-storage bucket %q", req.GetResourceName()))
+		out, err := ycInternal.ObjectStorageBucket(pctx, stack, input, pApi.ProvisionParams{Log: logger.New()})
+		if err != nil {
+			p.progress.Error("bucket", fmt.Sprintf("bucket %q failed: %v", req.GetResourceName(), err))
+			return nil, err
+		}
+		urn := waitForRef(out.Ref)
+		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
+		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+	case ycApi.TemplateTypeYandexServerlessContainer:
+		var tpl ycApi.TemplateConfig
+		if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
+			return nil, errors.Wrap(err, "decode serverless-container template config")
+		}
+		input := api.ResourceInput{
+			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &tpl}},
+			StackParams: stackParams,
+		}
+		p.progress.Info("serverless-container", fmt.Sprintf("provisioning serverless container %q", req.GetResourceName()))
+		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{Log: logger.New()})
+		if err != nil {
+			p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
+			return nil, err
+		}
+		urn := waitForRef(out.Ref)
+		p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
+		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+	default:
+		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
+	}
+}
+
+// ComputeProcess — the compute-side injection for a dependency bucket.
+// SC core calls this during dependency resolution so the downstream
+// serverless-container can see the bucket env vars.
+func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
+	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	if req.GetResourceType() != ycApi.ResourceTypeObjectStorageBucket {
+		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
+	}
+	var bucket ycApi.ObjectStorageBucket
+	if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
+		return nil, errors.Wrap(err, "decode bucket config for compute-process")
+	}
+	input := api.ResourceInput{
+		Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &bucket}},
+		StackParams: &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()},
+	}
+	stack := api.Stack{Name: req.GetHeader().GetStackName()}
+	p.progress.Info("compute-process", fmt.Sprintf("compute-processing bucket %q", req.GetResourceName()))
+	out, err := ycInternal.ObjectStorageBucketComputeProcessor(pctx, stack, input, nil, pApi.ProvisionParams{Log: logger.New()})
+	if err != nil {
+		return nil, err
+	}
+	urn := waitForRef(out.Ref)
+	return &scpluginv1.ComputeProcessResponse{Urn: urn}, nil
+}
+
+// InitStateStore — pre-engine. The sidecar on SC core calls this and
+// uses the returned env vars + backend URL to configure the Pulumi
+// workspace. The plugin's own InitStateStore mutates process env
+// (AWS_* for SigV4), which is fine because SC core and the plugin
+// share the engine process via hashicorp/go-plugin.
+func (p *ycPlugin) InitStateStore(ctx context.Context, req *scpluginv1.InitStateStoreRequest) (*scpluginv1.InitStateStoreResponse, error) {
+	var cfg ycApi.StateStorageConfig
+	if err := decodeInputsAs(req.GetConfig(), &cfg); err != nil {
+		return nil, errors.Wrap(err, "decode state-storage config")
+	}
+	p.progress.Info("state-store", fmt.Sprintf("configuring yc-object-storage backend (bucket=%q region=%q)", cfg.BucketName, cfg.EffectiveRegion()))
+	if err := ycInternal.InitStateStore(ctx, &cfg, logger.New()); err != nil {
+		p.progress.Error("state-store", fmt.Sprintf("init failed: %v", err))
+		return nil, err
+	}
+	// The driver already set AWS_* env vars in-process. Return the
+	// Pulumi backend URL so SC core's workspace points at the YC
+	// object-storage endpoint.
+	return &scpluginv1.InitStateStoreResponse{BackendUrl: cfg.StorageUrl()}, nil
+}
+
+// decodeInputsAs lifts the plugin-bus input map into a typed Go value
+// via YAML round-trip. YAML preserves `yaml:",inline"` tags that the
+// yandex configs lean on heavily (AccountConfig embedded in bucket,
+// StateStorageConfig, etc). The sidecar on SC core serializes via
+// JSON into the primitives map; here we go map → YAML → typed struct.
+func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
+	plain := make(map[string]any, len(inputs))
+	for k, v := range inputs {
+		switch x := v.GetValue().(type) {
+		case *scpluginv1.InputValue_StringValue:
+			plain[k] = x.StringValue
+		case *scpluginv1.InputValue_BoolValue:
+			plain[k] = x.BoolValue
+		case *scpluginv1.InputValue_DoubleValue:
+			plain[k] = x.DoubleValue
+		}
+	}
+	bytes, err := yaml.Marshal(plain)
+	if err != nil {
+		return err
+	}
+	return yaml.Unmarshal(bytes, out)
 }
 
 func (p *ycPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1.SCCloudPlugin_LogStreamServer) error {

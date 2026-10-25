@@ -8,17 +8,14 @@ A plugin binary lets SC drive Yandex Cloud resources without SC core having to v
 
 ## What this plugin does
 
-**V1 (now):** DNS registrar for `type: yc-dns`.
-- Zone lookup — resolves the stack's `zoneName` to a YC DNS zone id.
-- DNS records — bulk at provision time via `dnsRecords:`; per-record on demand via `NewRecord`.
-- Override-host rule — API Gateway spec in the registrar's folder that forwards to a different host, used by k3s-cloudrun / serverless-container domains.
-- Domain-for-endpoint — proxied record + override rule, in one call.
+**V2 — full in-tree surface**:
+- **DNS registrar** (`type: yc-dns`): zone lookup, bulk + per-record DNS, override-host rule (API Gateway), domain-for-endpoint shortcut.
+- **Provider** (`pulumi:providers:yandex`): the explicit `type: yandex` provider resource consumed by every other YC resource.
+- **Object Storage bucket** (`type: yc-bucket`): bucket + folder-level IAM role binding (`ResourcemanagerFolderIamMember`, additive — never `...FolderIamPolicy`).
+- **Serverless Container** (`type: yc-serverless-container`): single-image template with revision deploy.
+- **State storage** (`type: yc-object-storage`): Pulumi DIY backend over YC Object Storage via SigV4.
 
-**V2+ (follow-ups):**
-- `pulumi:providers:yandex` (Provider RPC).
-- `yc-bucket` (Provision + ComputeProcess) — Object Storage.
-- `yc-serverless-container` (Provision) — Serverless Containers.
-- `yc-object-storage` state storage (InitStateStore).
+Compute processors wire bucket env vars into downstream serverless-container runtime via the standard SC compute-processor path.
 
 ## Install
 
