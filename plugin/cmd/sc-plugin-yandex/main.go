@@ -466,6 +466,23 @@ func waitForComposite(ref any) string {
 	switch r := ref.(type) {
 	case *ycInternal.ObjectStorageBucketOutput:
 		return waitForIDs(r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
+	case *ycInternal.ServerlessContainerOutput:
+		// Container is always present. ServiceAccount + Registry are always
+		// created. Secret + SecretVersion only exist when the config carried
+		// secrets. Triggers are a slice — iterate and append IDs.
+		ids := []sdk.IDOutput{r.Container.ID(), r.ServiceAccount.ID(), r.Registry.ID()}
+		if r.Secret != nil {
+			ids = append(ids, r.Secret.ID())
+		}
+		if r.SecretVersion != nil {
+			ids = append(ids, r.SecretVersion.ID())
+		}
+		for _, t := range r.Triggers {
+			if t != nil {
+				ids = append(ids, t.ID())
+			}
+		}
+		return waitForIDs(ids...)
 	default:
 		return waitForRef(ref)
 	}
