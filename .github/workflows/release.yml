@@ -75,9 +75,17 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
           VERSION: ${{ needs.version.outputs.version }}
+          # pulumi-yandex SDK is enormous (~2 GB of generated types). Default
+          # go build parallelism OOMs the standard 7 GB GHA runner — same
+          # pattern that drove the sc-plugin extraction in the first place.
+          # Pin GOMAXPROCS=1 so only one compile process is in flight at a
+          # time, and GOMEMLIMIT so the Go GC pre-empts before the kernel
+          # does.
+          GOMAXPROCS: '1'
+          GOMEMLIMIT: '6GiB'
         run: |
           out=sc-plugin-yandex-${GOOS}-${GOARCH}
-          go build -trimpath -buildvcs=false \
+          go build -trimpath -buildvcs=false -p 1 \
             -ldflags "-s -w -X main.version=${VERSION}" \
             -o "../${out}" \
             ./cmd/sc-plugin-yandex
