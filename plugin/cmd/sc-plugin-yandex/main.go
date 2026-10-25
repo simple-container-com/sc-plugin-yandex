@@ -8,8 +8,8 @@
 // V2 scope — the full in-tree yandex surface:
 //   - pulumi:providers:yandex                 (Provider RPC)
 //   - yc-dns registrar                        (ProvisionRegistrar + NewDnsRecord +
-//                                              NewOverrideHeaderRule +
-//                                              ProvisionDomainForEndpoint)
+//     NewOverrideHeaderRule +
+//     ProvisionDomainForEndpoint)
 //   - yc-bucket                               (Provision + ComputeProcess)
 //   - yc-serverless-container                 (Provision)
 //   - yc-object-storage state store           (InitStateStore)
@@ -51,9 +51,17 @@ type ycPlugin struct {
 
 func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
-		PluginVersion:         "yandex-0.0.2",
-		StateStoreTypes:       []string{ycApi.StateStorageTypeYandexObjectStorage},
-		ProviderTypes:         []string{ycApi.ProviderType},
+		PluginVersion:   "yandex-0.0.3",
+		StateStoreTypes: []string{ycApi.StateStorageTypeYandexObjectStorage},
+		// Intentionally NOT advertising ProviderTypes. The lifted yandex
+		// Provider.go names its pulumi:providers:yandex resource after
+		// pcfg.FolderID — same formula in-tree and here. Having SC core
+		// call Provider() first would create the Provider in SC core's
+		// pctx, but each plugin Provision RPC opens its own pctx and
+		// the ProviderResource handle doesn't cross contexts. The plugin
+		// re-runs Provider inside each Provision instead: the URN stays
+		// byte-identical (same name, same provider version), and the
+		// bucket resource gets a live ProviderResource in the SAME pctx.
 		RegistrarTypes:        []string{ycApi.RegistrarTypeYandexDns},
 		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer},
 		ComputeProcessorTypes: []string{ycApi.ResourceTypeObjectStorageBucket},
@@ -129,7 +137,7 @@ func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecor
 		p.progress.Error("dns-record", fmt.Sprintf("record %q failed: %v", req.GetRecordName(), err))
 		return nil, err
 	}
-	urn := waitForRef(out.Ref)
+	urn := waitForComposite(out.Ref)
 	p.progress.Info("dns-record", fmt.Sprintf("record %q registered (urn=%s)", req.GetRecordName(), urn))
 	return &scpluginv1.NewDnsRecordResponse{Urn: urn}, nil
 }
@@ -164,7 +172,7 @@ func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.Ne
 		p.progress.Error("worker-route", fmt.Sprintf("rule %q failed: %v", rule.Name, err))
 		return nil, err
 	}
-	urn := waitForRef(out.Ref)
+	urn := waitForComposite(out.Ref)
 	p.progress.Info("worker-route", fmt.Sprintf("rule %q registered (urn=%s)", rule.Name, urn))
 	return &scpluginv1.NewOverrideHeaderRuleResponse{Urn: urn}, nil
 }
@@ -193,7 +201,7 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 		p.progress.Error("endpoint", fmt.Sprintf("endpoint %q failed: %v", endpoint.Name, err))
 		return nil, err
 	}
-	urn := waitForRef(out.Ref)
+	urn := waitForComposite(out.Ref)
 	p.progress.Info("endpoint", fmt.Sprintf("endpoint %q bound (urn=%s)", endpoint.Name, urn))
 	return &scpluginv1.ProvisionDomainForEndpointResponse{Urn: urn}, nil
 }
@@ -226,7 +234,7 @@ func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest
 		p.progress.Error("provider", fmt.Sprintf("provider init failed: %v", err))
 		return nil, errors.Wrap(err, "init yandex provider")
 	}
-	urn := waitForRef(out.Ref)
+	urn := waitForComposite(out.Ref)
 	p.progress.Info("provider", fmt.Sprintf("provider %q ready (urn=%s)", req.GetProviderResourceName(), urn))
 	return &scpluginv1.ProviderResponse{ProviderUrn: urn}, nil
 }
@@ -234,6 +242,13 @@ func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest
 // Provision — dispatch to the lifted bucket / serverless-container
 // driver based on resource_type. The sidecar on SC core routes types
 // advertised in Schema.resource_types here.
+//
+// Because Schema omits ProviderTypes, the plugin owns Provider
+// construction internally. The provider resource is built in the SAME
+// pctx the resource is created in, so params.Provider is a live handle
+// (not a cross-pctx URN wrapper). The provider's Pulumi resource name
+// is the folder id — identical to pre-split, so the URN is byte-
+// identical and no state replace+create fires on first plugin-era deploy.
 func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
 	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
@@ -248,17 +263,21 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
 			return nil, errors.Wrap(err, "decode bucket config")
 		}
+		provider, err := p.buildProvider(pctx, &bucket.AccountConfig, "bucket", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment())
+		if err != nil {
+			return nil, err
+		}
 		input := api.ResourceInput{
 			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &bucket}},
 			StackParams: stackParams,
 		}
 		p.progress.Info("bucket", fmt.Sprintf("provisioning object-storage bucket %q", req.GetResourceName()))
-		out, err := ycInternal.ObjectStorageBucket(pctx, stack, input, pApi.ProvisionParams{Log: logger.New()})
+		out, err := ycInternal.ObjectStorageBucket(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
 		if err != nil {
 			p.progress.Error("bucket", fmt.Sprintf("bucket %q failed: %v", req.GetResourceName(), err))
 			return nil, err
 		}
-		urn := waitForRef(out.Ref)
+		urn := waitForComposite(out.Ref)
 		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
@@ -266,22 +285,54 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
 			return nil, errors.Wrap(err, "decode serverless-container template config")
 		}
+		provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment())
+		if err != nil {
+			return nil, err
+		}
 		input := api.ResourceInput{
 			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &tpl}},
 			StackParams: stackParams,
 		}
 		p.progress.Info("serverless-container", fmt.Sprintf("provisioning serverless container %q", req.GetResourceName()))
-		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{Log: logger.New()})
+		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
 		if err != nil {
 			p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
 			return nil, err
 		}
-		urn := waitForRef(out.Ref)
+		urn := waitForComposite(out.Ref)
 		p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
 	}
+}
+
+// buildProvider instantiates pulumi:providers:yandex in the given pctx
+// via the lifted Provider function. The Pulumi resource name is
+// pcfg.FolderID (the lifted driver's convention), so the URN stays
+// byte-identical to pre-split. `phase` is used only for progress logs.
+func (p *ycPlugin) buildProvider(pctx *sdk.Context, acct *ycApi.AccountConfig, phase, stackName, env string) (sdk.ProviderResource, error) {
+	p.progress.Info(phase, fmt.Sprintf("initialising yandex provider (folder=%q)", acct.FolderID))
+	input := api.ResourceInput{
+		Descriptor: &api.ResourceDescriptor{
+			Type:   ycApi.ProviderType,
+			Name:   acct.FolderID,
+			Config: api.Config{Config: acct},
+		},
+		// Required: the lifted Provider calls input.ToResName which deref's
+		// StackParams.Environment. nil StackParams panics the plugin.
+		StackParams: &api.StackParams{StackName: stackName, Environment: env},
+	}
+	out, err := ycInternal.Provider(pctx, api.Stack{Name: stackName}, input, pApi.ProvisionParams{Log: logger.New()})
+	if err != nil {
+		p.progress.Error(phase, fmt.Sprintf("provider init failed: %v", err))
+		return nil, errors.Wrap(err, "init yandex provider")
+	}
+	prov, ok := out.Ref.(sdk.ProviderResource)
+	if !ok {
+		return nil, errors.Errorf("yandex Provider returned %T, not sdk.ProviderResource", out.Ref)
+	}
+	return prov, nil
 }
 
 // ComputeProcess — the compute-side injection for a dependency bucket.
@@ -310,7 +361,7 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 	if err != nil {
 		return nil, err
 	}
-	urn := waitForRef(out.Ref)
+	urn := waitForComposite(out.Ref)
 	return &scpluginv1.ComputeProcessResponse{Urn: urn}, nil
 }
 
@@ -399,6 +450,55 @@ func strVal(v *scpluginv1.InputValue) string {
 		return ""
 	}
 	return v.GetStringValue()
+}
+
+// waitForComposite blocks until the IDs of every known composite output
+// field resolve. Needed for ObjectStorageBucket (4 sub-resources),
+// ServerlessContainer (container + revision + SA), and any other lifted
+// surface that returns a struct of pulumi resources rather than a single
+// IDOutput. Returns the first resource's URN for logging; the plugin's
+// return value is coarse-grained since the SC-core-side consumer treats
+// Ref as a bag.
+func waitForComposite(ref any) string {
+	if ref == nil {
+		return ""
+	}
+	switch r := ref.(type) {
+	case *ycInternal.ObjectStorageBucketOutput:
+		return waitForIDs(r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
+	default:
+		return waitForRef(ref)
+	}
+}
+
+// waitForIDs blocks until every passed IDOutput resolves. Each ApplyT
+// closure signals once; the aggregator closes the done channel when the
+// last signal arrives. Returns the first ID as the headline URN.
+func waitForIDs(ids ...sdk.IDOutput) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	remaining := len(ids)
+	done := make(chan struct{})
+	var mu sync.Mutex
+	var first string
+	for i, id := range ids {
+		i, id := i, id
+		id.ApplyT(func(idv sdk.ID) sdk.ID {
+			mu.Lock()
+			if i == 0 {
+				first = string(idv)
+			}
+			remaining--
+			if remaining == 0 {
+				close(done)
+			}
+			mu.Unlock()
+			return idv
+		})
+	}
+	<-done
+	return first
 }
 
 // waitForRef blocks until a Pulumi Output in a resource ref resolves. See the
