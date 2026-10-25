@@ -263,7 +263,7 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
 			return nil, errors.Wrap(err, "decode bucket config")
 		}
-		provider, err := p.buildProvider(pctx, &bucket.AccountConfig, "bucket", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment())
+		provider, err := p.buildProvider(pctx, &bucket.AccountConfig, "bucket", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +285,7 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
 			return nil, errors.Wrap(err, "decode serverless-container template config")
 		}
-		provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment())
+		provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
 		if err != nil {
 			return nil, err
 		}
@@ -311,12 +311,19 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 // via the lifted Provider function. The Pulumi resource name is
 // pcfg.FolderID (the lifted driver's convention), so the URN stays
 // byte-identical to pre-split. `phase` is used only for progress logs.
-func (p *ycPlugin) buildProvider(pctx *sdk.Context, acct *ycApi.AccountConfig, phase, stackName, env string) (sdk.ProviderResource, error) {
-	p.progress.Info(phase, fmt.Sprintf("initialising yandex provider (folder=%q)", acct.FolderID))
+// buildProvider instantiates pulumi:providers:yandex in the given pctx
+// via the lifted Provider function. Uses SC core's naming formula —
+// `<stack>--<resType>--<resName>--<env>--provider` — so the resulting
+// Pulumi URN is byte-identical to what SC core's initProvider would have
+// produced on the pre-split binary. The lifted driver appends `--<env>`
+// via input.ToResName, matching initProvider's suffix behavior.
+func (p *ycPlugin) buildProvider(pctx *sdk.Context, acct *ycApi.AccountConfig, phase, stackName, env, resType, resName string) (sdk.ProviderResource, error) {
+	providerName := fmt.Sprintf("%s--%s--%s--%s--provider", stackName, resType, resName, env)
+	p.progress.Info(phase, fmt.Sprintf("initialising yandex provider %q (folder=%q)", providerName, acct.FolderID))
 	input := api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   ycApi.ProviderType,
-			Name:   acct.FolderID,
+			Name:   providerName,
 			Config: api.Config{Config: acct},
 		},
 		// Required: the lifted Provider calls input.ToResName which deref's
