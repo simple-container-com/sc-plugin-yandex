@@ -9,7 +9,7 @@ require (
 	github.com/pulumi/pulumi-docker/sdk/v4 v4.11.2
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261025132958-787fb0fe2efd
+	github.com/simple-container-com/api v0.0.0-20261026174833-b4a4eed70611
 	github.com/simple-container-com/pulumi-yandex/sdk v1.1.0
 	github.com/simple-container-com/sc-plugin-yandex/api v0.0.0-00010101000000-000000000000
 	gopkg.in/yaml.v3 v3.0.1
