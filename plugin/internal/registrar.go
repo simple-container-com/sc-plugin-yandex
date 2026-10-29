@@ -107,7 +107,7 @@ func zoneIDOf(zone *sdkYandex.LookupDnsZoneResult, cfg *yandex.RegistrarConfig) 
 // a folder holding two zones is one typo away from writing every record into the
 // wrong one, and a recordset in the wrong zone is silently inert rather than an
 // error.
-func lookupZone(ctx *sdk.Context, cfg *yandex.RegistrarConfig, provider *sdkYandex.Provider) (*sdkYandex.LookupDnsZoneResult, error) {
+func lookupZone(ctx *sdk.Context, cfg *yandex.RegistrarConfig, provider sdk.ProviderResource) (*sdkYandex.LookupDnsZoneResult, error) {
 	args := &sdkYandex.LookupDnsZoneArgs{FolderId: lo.ToPtr(cfg.FolderID)}
 	if cfg.ZoneID != "" {
 		args.DnsZoneId = lo.ToPtr(cfg.ZoneID)

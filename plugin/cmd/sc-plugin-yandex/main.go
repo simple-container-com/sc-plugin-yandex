@@ -63,7 +63,7 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 		// byte-identical (same name, same provider version), and the
 		// bucket resource gets a live ProviderResource in the SAME pctx.
 		RegistrarTypes:        []string{ycApi.RegistrarTypeYandexDns},
-		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer},
+		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer, ycApi.TemplateTypeYandexStaticWebsite},
 		ComputeProcessorTypes: []string{ycApi.ResourceTypeObjectStorageBucket},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
@@ -81,6 +81,9 @@ func (p *ycPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.Re
 		MonitorAddr: h.GetMonitorAddress(),
 		Project:     h.GetProjectName(),
 		Stack:       h.GetStackName(),
+		// A preview must not run side effects outside the engine (the static
+		// site's upload checks ctx.DryRun()); core sets this from its own context.
+		DryRun: h.GetDryRun(),
 	})
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
@@ -302,6 +305,37 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		urn := waitForComposite(out.Ref)
 		p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+	case ycApi.TemplateTypeYandexStaticWebsite:
+		var site ycApi.StaticWebsiteInput
+		if err := decodeInputsAs(req.GetInputs(), &site); err != nil {
+			return nil, errors.Wrap(err, "decode static website config")
+		}
+		provider, err := p.buildProvider(pctx, &site.AccountConfig, "static-website", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+		if err != nil {
+			return nil, err
+		}
+		input := api.ResourceInput{
+			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &site}},
+			StackParams: stackParams,
+		}
+		p.progress.Info("static-website", fmt.Sprintf("provisioning static website %q", site.Site.Domain))
+		out, err := ycInternal.StaticWebsite(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		if err != nil {
+			p.progress.Error("static-website", fmt.Sprintf("static website %q failed: %v", site.Site.Domain, err))
+			return nil, err
+		}
+		// AwaitAll, not waitForComposite: in a preview a new site's ids resolve
+		// unknown, and an ApplyT-based wait would block forever on them.
+		if err := scPlugin.AwaitAll(ctx, out.Ref.(*ycInternal.StaticWebsiteOutput).Outputs()...); err != nil {
+			p.progress.Error("static-website", fmt.Sprintf("static website %q failed: %v", site.Site.Domain, err))
+			return nil, err
+		}
+		urn, err := scPlugin.AwaitURN(ctx, out.Ref.(*ycInternal.StaticWebsiteOutput).Bucket)
+		if err != nil {
+			return nil, err
+		}
+		p.progress.Info("static-website", fmt.Sprintf("static website https://%s ready (urn=%s)", site.Site.Domain, urn))
+		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
 	}
@@ -399,18 +433,9 @@ func (p *ycPlugin) InitStateStore(ctx context.Context, req *scpluginv1.InitState
 // StateStorageConfig, etc). The sidecar on SC core serializes via
 // JSON into the primitives map; here we go map → YAML → typed struct.
 func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
-	plain := make(map[string]any, len(inputs))
-	for k, v := range inputs {
-		switch x := v.GetValue().(type) {
-		case *scpluginv1.InputValue_StringValue:
-			plain[k] = x.StringValue
-		case *scpluginv1.InputValue_BoolValue:
-			plain[k] = x.BoolValue
-		case *scpluginv1.InputValue_DoubleValue:
-			plain[k] = x.DoubleValue
-		}
-	}
-	bytes, err := yaml.Marshal(plain)
+	// InputsToPlain keeps nested maps and lists — a static site's `site` block, a
+	// container's whole `stackConfig` — which a scalar-only decode dropped.
+	bytes, err := yaml.Marshal(scPlugin.InputsToPlain(inputs))
 	if err != nil {
 		return err
 	}
