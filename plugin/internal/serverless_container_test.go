@@ -358,3 +358,49 @@ func TestServerlessContainer_UsesPreExistingRegistry(t *testing.T) {
 	Expect(mocks.inputsOf(tokenDockerImage)["imageName"].StringValue()).
 		To(Equal("cr.yandex/crp000000000000000000/test-stack:1.2.3"))
 }
+
+// Every env/secret read dereferences params.ComputeContext. A caller that forgets
+// it must get an error naming the problem, not a nil-pointer panic that kills the
+// plugin subprocess mid-deploy.
+func TestServerlessContainer_NilComputeContextIsAnError(t *testing.T) {
+	RegisterTestingT(t)
+
+	mocks := newBucketMocks()
+	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
+		params, err := bucketProvisionParams(ctx)
+		if err != nil {
+			return err
+		}
+		params.ComputeContext = nil
+		_, err = ServerlessContainer(ctx, api.Stack{Name: "test-stack"}, containerResourceInput(baseContainerInput()), params)
+		return err
+	}, pulumi.WithMocks("project", "stack", mocks))
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("compute context must not be nil"))
+	Expect(mocks.countOf(tokenContainer)).To(Equal(0))
+}
+
+// What the consuming stack's `uses:` resources contributed (e.g. MONGO_* from a
+// mongodb resource) must reach the container: plain vars in its environment,
+// secret ones as Lockbox references — never inlined.
+func TestServerlessContainer_ComputeContextEnvReachesContainer(t *testing.T) {
+	RegisterTestingT(t)
+
+	mocks := newBucketMocks()
+	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
+		params, err := containerProvisionParams(ctx)
+		if err != nil {
+			return err
+		}
+		params.ComputeContext.(pApi.ComputeContextCollector).AddEnvVariableIfNotExist("MONGO_DB", "app", "mongodb-atlas", "mongodb", "test-stack")
+		params.ComputeContext.(pApi.ComputeContextCollector).AddSecretEnvVariableIfNotExist("MONGO_URI", "mongodb+srv://u:p@h", "mongodb-atlas", "mongodb", "test-stack")
+		_, err = ServerlessContainer(ctx, api.Stack{Name: "test-stack"}, containerResourceInput(baseContainerInput()), params)
+		return err
+	}, pulumi.WithMocks("project", "stack", mocks))
+	Expect(err).ToNot(HaveOccurred())
+
+	env := mocks.inputsOf(tokenContainer)["image"].ObjectValue()["environment"].ObjectValue()
+	Expect(env["MONGO_DB"].StringValue()).To(Equal("app"))
+	Expect(env).ToNot(HaveKey(resource.PropertyKey("MONGO_URI")), "a secret must not be inlined into the container env")
+	Expect(mocks.countOf(tokenLockboxVersion)).To(Equal(1))
+}
