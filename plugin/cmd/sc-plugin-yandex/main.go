@@ -63,8 +63,8 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 		// byte-identical (same name, same provider version), and the
 		// bucket resource gets a live ProviderResource in the SAME pctx.
 		RegistrarTypes:        []string{ycApi.RegistrarTypeYandexDns},
-		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer, ycApi.TemplateTypeYandexStaticWebsite},
-		ComputeProcessorTypes: []string{ycApi.ResourceTypeObjectStorageBucket},
+		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer, ycApi.TemplateTypeYandexStaticWebsite, ycApi.ResourceTypePostgres},
+		ComputeProcessorTypes: []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.ResourceTypePostgres},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
 			// terraform-provider-yandex (pulumi/pulumi-yandex is archived at v0.13.0).
@@ -284,9 +284,13 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
-		var tpl ycApi.TemplateConfig
+		// The deploy input is the converted ServerlessContainerInput (template +
+		// the client's whole stackConfig), not the bare TemplateConfig: decoding
+		// into TemplateConfig lost the image, env and secrets, and
+		// ServerlessContainer refused the type.
+		var tpl ycApi.ServerlessContainerInput
 		if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
-			return nil, errors.Wrap(err, "decode serverless-container template config")
+			return nil, errors.Wrap(err, "decode serverless-container input")
 		}
 		provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
 		if err != nil {
@@ -297,7 +301,11 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			StackParams: stackParams,
 		}
 		p.progress.Info("serverless-container", fmt.Sprintf("provisioning serverless container %q", req.GetResourceName()))
-		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{
+			Log:            logger.New(),
+			Provider:       provider,
+			ComputeContext: computeContextFromInputs(pctx, req.GetInputs(), req.GetHeader()),
+		})
 		if err != nil {
 			p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
 			return nil, err
@@ -335,6 +343,36 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			return nil, err
 		}
 		p.progress.Info("static-website", fmt.Sprintf("static website https://%s ready (urn=%s)", site.Site.Domain, urn))
+		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+	case ycApi.ResourceTypePostgres:
+		var pg ycApi.PostgresConfig
+		if err := decodeInputsAs(req.GetInputs(), &pg); err != nil {
+			return nil, errors.Wrap(err, "decode postgres config")
+		}
+		provider, err := p.buildProvider(pctx, &pg.AccountConfig, "postgres", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+		if err != nil {
+			return nil, err
+		}
+		input := api.ResourceInput{
+			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &pg}},
+			StackParams: stackParams,
+		}
+		p.progress.Info("postgres", fmt.Sprintf("provisioning managed postgres %q", req.GetResourceName()))
+		out, err := ycInternal.Postgres(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		if err != nil {
+			p.progress.Error("postgres", fmt.Sprintf("postgres %q failed: %v", req.GetResourceName(), err))
+			return nil, err
+		}
+		pgOut := out.Ref.(*ycInternal.PostgresOutput)
+		if err := scPlugin.AwaitAll(ctx, pgOut.Outputs()...); err != nil {
+			p.progress.Error("postgres", fmt.Sprintf("postgres %q failed: %v", req.GetResourceName(), err))
+			return nil, err
+		}
+		urn, err := scPlugin.AwaitURN(ctx, pgOut.Cluster)
+		if err != nil {
+			return nil, err
+		}
+		p.progress.Info("postgres", fmt.Sprintf("postgres %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
@@ -385,6 +423,9 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 		return nil, err
 	}
 	defer done()
+	if req.GetResourceType() == ycApi.ResourceTypePostgres {
+		return p.computeProcessPostgres(ctx, pctx, req)
+	}
 	if req.GetResourceType() != ycApi.ResourceTypeObjectStorageBucket {
 		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
 	}
@@ -440,6 +481,112 @@ func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) err
 		return err
 	}
 	return yaml.Unmarshal(bytes, out)
+}
+
+// computeProcessPostgres reads a yc-postgres's connection out of the parent stack and
+// returns it as env vars and placeholders; SC core puts them into the consuming
+// stack's compute context (pulumi.applyComputeProcessResponse).
+func (p *ycPlugin) computeProcessPostgres(ctx context.Context, pctx *sdk.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
+	parent := parentInfoFromDependencyOutputs(req.GetDependencyOutputs())
+	if parent == nil {
+		return nil, errors.Errorf("yc-postgres %q: SC core sent no parent stack — it is older than the yc-postgres compute processor", req.GetResourceName())
+	}
+	if !parent.UsesResource {
+		// Same rule as aws-rds-postgres: a database is consumed via `uses`.
+		return nil, errors.Errorf("yc-postgres %q only supports `uses`, not `dependencies`", req.GetResourceName())
+	}
+	stack := api.Stack{Name: req.GetHeader().GetStackName()}
+	p.progress.Info("compute-process", fmt.Sprintf("reading postgres %q from %q", req.GetResourceName(), parent.FullReference))
+	conn, ref, err := ycInternal.ReadPostgresConnection(pctx, stack, req.GetResourceName(), parent)
+	if err != nil {
+		return nil, err
+	}
+	urn, err := scPlugin.AwaitURN(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	env, secret := conn.ConsumerEnv(req.GetResourceName())
+	resp := &scpluginv1.ComputeProcessResponse{Env: map[string]*scpluginv1.InputValue{}, Placeholders: conn.Placeholders(), Urn: urn}
+	for k, v := range env {
+		resp.Env[k] = &scpluginv1.InputValue{Value: &scpluginv1.InputValue_StringValue{StringValue: v}, Secret: secret[k]}
+	}
+	return resp, nil
+}
+
+// Keys SC core puts into ComputeProcessRequest.dependency_outputs (see
+// pulumi.parentInfoToDependencyOutputs in SC core).
+const (
+	depOutParentStackName     = "sc.parentStack.stackName"
+	depOutParentEnv           = "sc.parentStack.parentEnv"
+	depOutParentResourceEnv   = "sc.parentStack.resourceEnv"
+	depOutParentFullReference = "sc.parentStack.fullReference"
+	depOutParentStackEnv      = "sc.parentStack.stackEnv"
+	depOutDependsOnResource   = "sc.parentStack.dependsOnResource"
+	depOutUsesResource        = "sc.parentStack.usesResource"
+)
+
+func parentInfoFromDependencyOutputs(m map[string]string) *pApi.ParentInfo {
+	if m[depOutParentFullReference] == "" {
+		return nil
+	}
+	p := &pApi.ParentInfo{
+		StackName:     m[depOutParentStackName],
+		ParentEnv:     m[depOutParentEnv],
+		ResourceEnv:   m[depOutParentResourceEnv],
+		FullReference: m[depOutParentFullReference],
+		StackEnv:      m[depOutParentStackEnv],
+		UsesResource:  m[depOutUsesResource] == "true",
+	}
+	if name := m[depOutDependsOnResource]; name != "" {
+		p.DependsOnResource = &api.StackConfigDependencyResource{Name: name}
+	}
+	return p
+}
+
+// computeEnvInputKey is where SC core puts the consuming stack's compute-context
+// env on a ProvisionRequest (pulumi.ComputeEnvInputKey in SC core).
+const computeEnvInputKey = "__scComputeEnv"
+
+type computeEnvEntry struct {
+	Name         string `yaml:"name"`
+	Value        string `yaml:"value"`
+	Secret       bool   `yaml:"secret"`
+	ResourceName string `yaml:"resourceName"`
+	ResourceType string `yaml:"resourceType"`
+	StackName    string `yaml:"stackName"`
+}
+
+// computeContextFromInputs rebuilds the compute context SC core collected from the
+// stack's `uses:` resources, so a plugin compute template sees the same env an
+// in-tree one reads from params.ComputeContext. An older core sends none, and the
+// context is empty — which is what the template got before, minus the nil panic.
+func computeContextFromInputs(pctx *sdk.Context, inputs map[string]*scpluginv1.InputValue, h *scpluginv1.RequestHeader) pApi.ComputeContextCollector {
+	collector := pApi.NewComputeContextCollector(pctx.Context(), logger.New(), h.GetStackName(), h.GetEnvironment())
+	raw, ok := inputs[computeEnvInputKey]
+	if !ok {
+		return collector
+	}
+	b, err := yaml.Marshal(decodePlain(raw))
+	if err != nil {
+		return collector
+	}
+	var entries []computeEnvEntry
+	if err := yaml.Unmarshal(b, &entries); err != nil {
+		return collector
+	}
+	for _, e := range entries {
+		if e.Secret {
+			collector.AddSecretEnvVariableIfNotExist(e.Name, e.Value, e.ResourceType, e.ResourceName, e.StackName)
+		} else {
+			collector.AddEnvVariableIfNotExist(e.Name, e.Value, e.ResourceType, e.ResourceName, e.StackName)
+		}
+	}
+	return collector
+}
+
+func decodePlain(v *scpluginv1.InputValue) any {
+	plain, _ := scPlugin.InputValueToPlain(v)
+	return plain
 }
 
 func (p *ycPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1.SCCloudPlugin_LogStreamServer) error {
