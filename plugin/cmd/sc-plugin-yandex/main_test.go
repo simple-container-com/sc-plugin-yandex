@@ -127,7 +127,7 @@ func TestComputeContextFromRequest(t *testing.T) {
 			Header: &scpluginv1.RequestHeader{StackName: "backend", Environment: "staging-ru"},
 			ComputeEnvVars: []*scpluginv1.ComputeEnvVariable{
 				{Name: "MONGO_DB", Value: "app", ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
-				{Name: "MONGO_URI", Value: "mongodb+srv://u:p@h", Secret: true, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
+				{Name: "MONGO_URI", Value: "mongo-uri-placeholder", Secret: true, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
 				{Name: "", Value: "dropped"},
 			},
 		}
