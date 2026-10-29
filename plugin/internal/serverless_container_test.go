@@ -393,7 +393,7 @@ func TestServerlessContainer_ComputeContextEnvReachesContainer(t *testing.T) {
 			return err
 		}
 		params.ComputeContext.(pApi.ComputeContextCollector).AddEnvVariableIfNotExist("MONGO_DB", "app", "mongodb-atlas", "mongodb", "test-stack")
-		params.ComputeContext.(pApi.ComputeContextCollector).AddSecretEnvVariableIfNotExist("MONGO_URI", "mongodb+srv://u:p@h", "mongodb-atlas", "mongodb", "test-stack")
+		params.ComputeContext.(pApi.ComputeContextCollector).AddSecretEnvVariableIfNotExist("MONGO_URI", "mongo-uri-placeholder", "mongodb-atlas", "mongodb", "test-stack")
 		_, err = ServerlessContainer(ctx, api.Stack{Name: "test-stack"}, containerResourceInput(baseContainerInput()), params)
 		return err
 	}, pulumi.WithMocks("project", "stack", mocks))
