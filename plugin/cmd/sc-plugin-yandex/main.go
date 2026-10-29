@@ -113,8 +113,13 @@ func (p *ycPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.Re
 	if h.GetMonitorAddress() == "" {
 		return nil, nil, errors.New("no monitor address in request header")
 	}
+	engineAddr, err := engineAddress(h.GetEngineAddress(), p.progress)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "start local pulumi engine endpoint")
+	}
 	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
 		MonitorAddr: h.GetMonitorAddress(),
+		EngineAddr:  engineAddr,
 		Project:     h.GetProjectName(),
 		Stack:       h.GetStackName(),
 	})
