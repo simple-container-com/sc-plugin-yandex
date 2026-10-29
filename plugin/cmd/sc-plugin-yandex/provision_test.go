@@ -4,8 +4,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
@@ -27,9 +30,14 @@ type engineMocks struct {
 	mu      sync.Mutex
 	preview bool
 	created map[string]int
+	// slow delays the registration of these types, as the live engine does
+	// while it calls the cloud API; created counts a registration once its
+	// delay has passed, i.e. once the engine has it.
+	slow map[string]time.Duration
 }
 
 func (m *engineMocks) NewResource(args sdk.MockResourceArgs) (string, resource.PropertyMap, error) {
+	time.Sleep(m.slow[args.TypeToken])
 	m.mu.Lock()
 	if m.created == nil {
 		m.created = map[string]int{}
@@ -286,4 +294,72 @@ func TestProvisionServerlessContainer_PreExistingServiceAccountAndRegistry(t *te
 	Expect(err).ToNot(HaveOccurred())
 	Expect(mocks.count("yandex:index/iamServiceAccount:IamServiceAccount")).To(Equal(0))
 	Expect(mocks.count("yandex:index/containerRegistry:ContainerRegistry")).To(Equal(0))
+}
+
+const tokenContainerIamBinding = "yandex:index/serverlessContainerIamBinding:ServerlessContainerIamBinding"
+
+// Regression for two-peaks run 40954213000: the container's invoker binding
+// never reached the engine, so the container answered 403 to everyone. Its
+// ContainerId is container.ID(), so the SDK registers it from a goroutine once
+// the container's id resolves — and Provision waited only for the container's
+// own outputs before responding and closing its context, which dropped the
+// binding's pending RegisterResource. Unlike the tests above (which run inside
+// sdk.RunErr, whose drain hid the bug), this drives the real gRPC handler with
+// the context lifecycle it has live, and checks the engine holds the binding
+// the moment Provision has returned.
+func TestProvision_RegistersInvokerBindingBeforeReturning(t *testing.T) {
+	RegisterTestingT(t)
+	p := newTestPlugin()
+	opts := sdk.WithMocks("two-peaks", "staging-ru", &engineMocks{})
+	for _, reg := range forgeInfraRegistrars() {
+		Expect(sdk.RunErr(func(pctx *sdk.Context) error {
+			_, err := p.provisionRegistrar(pctx, reg)
+			return err
+		}, opts)).To(Succeed())
+	}
+	mocks := &engineMocks{slow: map[string]time.Duration{tokenContainerIamBinding: 300 * time.Millisecond}}
+	p.newPulumiContext = func(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, error) {
+		return sdk.NewContext(ctx, sdk.RunInfo{Project: "two-peaks", Stack: h.GetStackName(), Mocks: mocks})
+	}
+
+	resp, err := p.Provision(context.Background(), twoPeaksRequest(t, nil, nil))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(resp).ToNot(BeNil())
+	Expect(mocks.count(tokenContainerIamBinding)).To(Equal(1), "the invoker binding must be registered before Provision returns")
+}
+
+// failingMocks refuses one resource type, as the engine refuses a registration
+// the cloud rejects.
+type failingMocks struct {
+	engineMocks
+	refuse string
+}
+
+func (m *failingMocks) NewResource(args sdk.MockResourceArgs) (string, resource.PropertyMap, error) {
+	if args.TypeToken == m.refuse {
+		return "", nil, errors.New("PermissionDenied: cannot set access bindings")
+	}
+	return m.engineMocks.NewResource(args)
+}
+
+// A registration that fails after the handler has its outputs fails the RPC:
+// it was swallowed with the context, and the deploy went green without it.
+func TestProvision_FailedPendingRegistrationFailsTheRPC(t *testing.T) {
+	RegisterTestingT(t)
+	p := newTestPlugin()
+	opts := sdk.WithMocks("two-peaks", "staging-ru", &engineMocks{})
+	for _, reg := range forgeInfraRegistrars() {
+		Expect(sdk.RunErr(func(pctx *sdk.Context) error {
+			_, err := p.provisionRegistrar(pctx, reg)
+			return err
+		}, opts)).To(Succeed())
+	}
+	mocks := &failingMocks{refuse: tokenContainerIamBinding}
+	p.newPulumiContext = func(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, error) {
+		return sdk.NewContext(ctx, sdk.RunInfo{Project: "two-peaks", Stack: h.GetStackName(), Mocks: mocks})
+	}
+
+	resp, err := p.Provision(context.Background(), twoPeaksRequest(t, nil, nil))
+	Expect(err).To(MatchError(ContainSubstring("cannot set access bindings")))
+	Expect(resp).To(BeNil())
 }
