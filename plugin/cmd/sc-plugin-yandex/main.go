@@ -30,6 +30,7 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/samber/lo"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
@@ -43,10 +44,45 @@ import (
 type ycPlugin struct {
 	scpluginv1.UnimplementedSCCloudPluginServer
 
-	mu        sync.Mutex
-	registrar pApi.Registrar
-	config    *ycApi.RegistrarConfig
-	progress  *scPlugin.Publisher
+	mu sync.Mutex
+	// registrars holds every yc-dns registrar SC core initialised in this
+	// process, in the order it did so. A parent stack may declare several (the
+	// fleet's forge/infra declares one for atriumdev.ru and one for
+	// simple-forge.ru), and a single slot let the last one initialised answer
+	// for a domain in the other's zone.
+	registrars []pApi.Registrar
+	progress   *scPlugin.Publisher
+}
+
+// registrarForDomain returns the registrar whose zone serves domain — the
+// longest such zone — or nil when none of the initialised ones does.
+func (p *ycPlugin) registrarForDomain(domain string) pApi.Registrar {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var best pApi.Registrar
+	bestLen := -1
+	for _, r := range p.registrars {
+		zone := r.MainDomain()
+		if api.DomainInZone(domain, zone) && len(zone) > bestLen {
+			best, bestLen = r, len(zone)
+		}
+	}
+	return best
+}
+
+// registrarFor picks the registrar for a DNS RPC from SC core: the one whose
+// zone serves name, else — for a name that is not a domain under any of them —
+// the most recently initialised, which is what the single-slot plugin did.
+func (p *ycPlugin) registrarFor(name string) pApi.Registrar {
+	if r := p.registrarForDomain(name); r != nil {
+		return r
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.registrars) == 0 {
+		return nil
+	}
+	return p.registrars[len(p.registrars)-1]
 }
 
 func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
@@ -95,7 +131,10 @@ func (p *ycPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.Provi
 		return nil, err
 	}
 	defer done()
+	return p.provisionRegistrar(pctx, req)
+}
 
+func (p *ycPlugin) provisionRegistrar(pctx *sdk.Context, req *scpluginv1.ProvisionRegistrarRequest) (*scpluginv1.ProvisionRegistrarResponse, error) {
 	cfg := inputsToRegistrarConfig(req.GetConfig())
 	desc := api.RegistrarDescriptor{
 		Type:   ycApi.RegistrarTypeYandexDns,
@@ -107,8 +146,10 @@ func (p *ycPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.Provi
 		return nil, errors.Wrap(err, "init yandex registrar")
 	}
 	p.mu.Lock()
-	p.registrar = r
-	p.config = cfg
+	// Re-initialising a zone replaces its entry rather than adding a second one.
+	p.registrars = append(lo.Filter(p.registrars, func(existing pApi.Registrar, _ int) bool {
+		return existing.MainDomain() != r.MainDomain()
+	}), r)
 	p.mu.Unlock()
 	p.progress.Info("provision-registrar", fmt.Sprintf("ready; main domain is %q", r.MainDomain()))
 	return &scpluginv1.ProvisionRegistrarResponse{MainDomain: r.MainDomain()}, nil
@@ -120,9 +161,7 @@ func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecor
 		return nil, err
 	}
 	defer done()
-	p.mu.Lock()
-	r := p.registrar
-	p.mu.Unlock()
+	r := p.registrarFor(req.GetRecordName())
 	if r == nil {
 		return nil, errors.New("NewDnsRecord called before ProvisionRegistrar")
 	}
@@ -148,9 +187,7 @@ func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.Ne
 		return nil, err
 	}
 	defer done()
-	p.mu.Lock()
-	r := p.registrar
-	p.mu.Unlock()
+	r := p.registrarFor(req.GetFromHost())
 	if r == nil {
 		return nil, errors.New("NewOverrideHeaderRule called before ProvisionRegistrar")
 	}
@@ -183,9 +220,7 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 		return nil, err
 	}
 	defer done()
-	p.mu.Lock()
-	r := p.registrar
-	p.mu.Unlock()
+	r := p.registrarFor(req.GetDomain())
 	if r == nil {
 		return nil, errors.New("ProvisionDomainForEndpoint called before ProvisionRegistrar")
 	}
@@ -281,38 +316,57 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
-		// The deploy input is SC core's converted ServerlessContainerInput (the
-		// template's account config + the client's whole stackConfig), not the
-		// bare TemplateConfig: decoding into TemplateConfig lost the image, env
-		// and secrets, and ServerlessContainer refused the type.
-		var tpl ycApi.ServerlessContainerInput
-		if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
-			return nil, errors.Wrap(err, "decode serverless-container input")
-		}
-		provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
-		if err != nil {
-			return nil, err
-		}
-		input := api.ResourceInput{
-			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &tpl}},
-			StackParams: stackParams,
-		}
-		p.progress.Info("serverless-container", fmt.Sprintf("provisioning serverless container %q", req.GetResourceName()))
-		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{
-			Log:            logger.New(),
-			Provider:       provider,
-			ComputeContext: computeContextFromRequest(pctx, req),
-		})
-		if err != nil {
-			p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
-			return nil, err
-		}
-		urn := waitForComposite(out.Ref)
-		p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
-		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+		return p.provisionServerlessContainer(pctx, req)
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
 	}
+}
+
+// provisionServerlessContainer is the yc-serverless-container branch of
+// Provision, split out so a test can drive it against Pulumi mocks with the
+// exact request SC core puts on the bus.
+func (p *ycPlugin) provisionServerlessContainer(pctx *sdk.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
+	stack := api.Stack{Name: req.GetHeader().GetStackName()}
+	stackParams := &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()}
+	// The deploy input is SC core's converted ServerlessContainerInput (the
+	// template's account config + the client's whole stackConfig), not the
+	// bare TemplateConfig: decoding into TemplateConfig lost the image, env
+	// and secrets, and ServerlessContainer refused the type.
+	var tpl ycApi.ServerlessContainerInput
+	if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
+		return nil, errors.Wrap(err, "decode serverless-container input")
+	}
+	provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+	if err != nil {
+		return nil, err
+	}
+	input := api.ResourceInput{
+		Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &tpl}},
+		StackParams: stackParams,
+	}
+	p.progress.Info("serverless-container", fmt.Sprintf("provisioning serverless container %q", req.GetResourceName()))
+	// The in-tree template got SC core's registrar in params.Registrar and handed
+	// it the custom domain. Nothing crosses the bus for it, so the plugin uses the
+	// yc-dns registrar it holds for that domain's zone. Left nil when it holds
+	// none, which ServerlessContainer reports as an error instead of
+	// dereferencing it — the nil deref was what took this process down.
+	var registrar pApi.Registrar
+	if domain := tpl.StackConfig.Domain; domain != "" {
+		registrar = p.registrarForDomain(domain)
+	}
+	out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{
+		Log:            logger.New(),
+		Provider:       provider,
+		ComputeContext: computeContextFromRequest(pctx, req),
+		Registrar:      registrar,
+	})
+	if err != nil {
+		p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
+	urn := waitForComposite(out.Ref)
+	p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
+	return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 }
 
 // buildProvider instantiates pulumi:providers:yandex in the given pctx
@@ -495,10 +549,18 @@ func waitForComposite(ref any) string {
 	case *ycInternal.ObjectStorageBucketOutput:
 		return waitForIDs(r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
 	case *ycInternal.ServerlessContainerOutput:
-		// Container is always present. ServiceAccount + Registry are always
-		// created. Secret + SecretVersion only exist when the config carried
-		// secrets. Triggers are a slice — iterate and append IDs.
-		ids := []sdk.IDOutput{r.Container.ID(), r.ServiceAccount.ID(), r.Registry.ID()}
+		// Container is always present. Secret + SecretVersion only exist when
+		// the config carried secrets. Triggers are a slice — iterate and append IDs.
+		// ServiceAccount is nil when the template names a pre-existing
+		// serviceAccountId, Registry when it names a registryId: SC created
+		// neither, so there is nothing to wait for.
+		ids := []sdk.IDOutput{r.Container.ID()}
+		if r.ServiceAccount != nil {
+			ids = append(ids, r.ServiceAccount.ID())
+		}
+		if r.Registry != nil {
+			ids = append(ids, r.Registry.ID())
+		}
 		if r.Secret != nil {
 			ids = append(ids, r.Secret.ID())
 		}
