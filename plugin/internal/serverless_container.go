@@ -95,6 +95,12 @@ func ServerlessContainer(ctx *sdk.Context, stack api.Stack, input api.ResourceIn
 	if params.Provider == nil {
 		return nil, errors.Errorf("provider must not be nil for serverless container in stack %q", stack.Name)
 	}
+	if params.ComputeContext == nil {
+		// Every read below dereferences it. A caller with nothing to contribute
+		// (no `uses:`) passes an empty collector; nil is a wiring bug, and an
+		// error names it where a panic would take the whole plugin down.
+		return nil, errors.Errorf("compute context must not be nil for serverless container in stack %q", stack.Name)
+	}
 	if crInput.FolderID == "" {
 		return nil, errors.Errorf("folderId must be set for serverless container in stack %q", stack.Name)
 	}

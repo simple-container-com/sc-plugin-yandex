@@ -281,9 +281,13 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
-		var tpl ycApi.TemplateConfig
+		// The deploy input is SC core's converted ServerlessContainerInput (the
+		// template's account config + the client's whole stackConfig), not the
+		// bare TemplateConfig: decoding into TemplateConfig lost the image, env
+		// and secrets, and ServerlessContainer refused the type.
+		var tpl ycApi.ServerlessContainerInput
 		if err := decodeInputsAs(req.GetInputs(), &tpl); err != nil {
-			return nil, errors.Wrap(err, "decode serverless-container template config")
+			return nil, errors.Wrap(err, "decode serverless-container input")
 		}
 		provider, err := p.buildProvider(pctx, &tpl.AccountConfig, "serverless-container", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
 		if err != nil {
@@ -294,7 +298,11 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			StackParams: stackParams,
 		}
 		p.progress.Info("serverless-container", fmt.Sprintf("provisioning serverless container %q", req.GetResourceName()))
-		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{
+			Log:            logger.New(),
+			Provider:       provider,
+			ComputeContext: computeContextFromRequest(pctx, req),
+		})
 		if err != nil {
 			p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
 			return nil, err
@@ -399,22 +407,35 @@ func (p *ycPlugin) InitStateStore(ctx context.Context, req *scpluginv1.InitState
 // StateStorageConfig, etc). The sidecar on SC core serializes via
 // JSON into the primitives map; here we go map → YAML → typed struct.
 func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
-	plain := make(map[string]any, len(inputs))
-	for k, v := range inputs {
-		switch x := v.GetValue().(type) {
-		case *scpluginv1.InputValue_StringValue:
-			plain[k] = x.StringValue
-		case *scpluginv1.InputValue_BoolValue:
-			plain[k] = x.BoolValue
-		case *scpluginv1.InputValue_DoubleValue:
-			plain[k] = x.DoubleValue
-		}
-	}
-	bytes, err := yaml.Marshal(plain)
+	// InputsToPlain keeps nested maps and lists — a container's whole
+	// `stackConfig` — which the old scalar-only decode silently dropped.
+	bytes, err := yaml.Marshal(scPlugin.InputsToPlain(inputs))
 	if err != nil {
 		return err
 	}
 	return yaml.Unmarshal(bytes, out)
+}
+
+// computeContextFromRequest rebuilds the compute context SC core collected from
+// the consuming stack's `uses:` resources (ProvisionRequest.compute_env_vars), so
+// the plugin's compute template sees the env an in-tree template reads from
+// params.ComputeContext. Dependencies() stay empty: they are sdk.Resource handles
+// of core's context and do not cross the bus. An older core sends no env, and
+// the context is simply empty — never nil, so the template cannot panic on it.
+func computeContextFromRequest(pctx *sdk.Context, req *scpluginv1.ProvisionRequest) pApi.ComputeContextCollector {
+	h := req.GetHeader()
+	collector := pApi.NewComputeContextCollector(pctx.Context(), logger.New(), h.GetStackName(), h.GetEnvironment())
+	for _, v := range req.GetComputeEnvVars() {
+		if v.GetName() == "" {
+			continue
+		}
+		if v.GetSecret() {
+			collector.AddSecretEnvVariableIfNotExist(v.GetName(), v.GetValue(), v.GetResourceType(), v.GetResourceName(), v.GetStackName())
+		} else {
+			collector.AddEnvVariableIfNotExist(v.GetName(), v.GetValue(), v.GetResourceType(), v.GetResourceName(), v.GetStackName())
+		}
+	}
+	return collector
 }
 
 func (p *ycPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1.SCCloudPlugin_LogStreamServer) error {
