@@ -13,6 +13,7 @@ A plugin binary lets SC drive Yandex Cloud resources without SC core having to v
 - **Provider** (`pulumi:providers:yandex`): the explicit `type: yandex` provider resource consumed by every other YC resource.
 - **Object Storage bucket** (`type: yc-bucket`): bucket + folder-level IAM role binding (`ResourcemanagerFolderIamMember`, additive — never `...FolderIamPolicy`).
 - **Serverless Container** (`type: yc-serverless-container`): single-image template with revision deploy.
+- **Managed PostgreSQL** (`type: yc-postgres`): cluster + one database + one user (password from `${secret:...}`), dedicated VPC network/subnets unless `networkId` is given, security group opening only 6432 to `allowedCidrs`. Compute processor hands `uses:` consumers `PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD/PGSSLMODE/DATABASE_URL` (plus `_<RESOURCE>` copies). Public host + TLS by default — see SC docs for the trade-off and what is not supported.
 - **Static website** (`type: yc-static-website`): template for `type: static` stacks — Object Storage website bucket named after the domain, public read, HTTPS from Certificate Manager (adopted by id/name, or a managed Let's Encrypt cert with DNS-CNAME challenge), `CNAME <domain> → <domain>.website.yandexcloud.net.` in a yc-dns zone, and a `sync --delete` upload of `bundleDir` with Cache-Control rules (HTML `no-cache`, `assets/**` immutable, rest 1 h). Skipped uploads in preview. Reference: SC docs `reference/supported-resources.md`.
 - **State storage** (`type: yc-object-storage`): Pulumi DIY backend over YC Object Storage via SigV4.
 

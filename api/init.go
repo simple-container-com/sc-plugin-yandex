@@ -18,6 +18,7 @@ func init() {
 		TemplateTypeYandexServerlessContainer: ReadTemplateConfig,
 		TemplateTypeYandexStaticWebsite:       ReadStaticWebsiteTemplateConfig,
 		ResourceTypeObjectStorageBucket:       ReadObjectStorageBucketConfig,
+		ResourceTypePostgres:                  ReadPostgresConfig,
 		RegistrarTypeYandexDns:                ReadRegistrarConfig,
 	})
 
@@ -53,6 +54,7 @@ func init() {
 			ProviderType,                          // "yandex" — the pulumi provider
 			RegistrarTypeYandexDns,                // "yc-dns"
 			ResourceTypeObjectStorageBucket,       // "yc-bucket"
+			ResourceTypePostgres,                  // "yc-postgres"
 			TemplateTypeYandexServerlessContainer, // "yc-serverless-container"
 			TemplateTypeYandexStaticWebsite,       // "yc-static-website"
 			StateStorageTypeYandexObjectStorage,   // "yc-object-storage" (state backend)
