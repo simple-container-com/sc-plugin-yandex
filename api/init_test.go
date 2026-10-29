@@ -23,6 +23,7 @@ func TestProviderConfigsRegistered(t *testing.T) {
 		AuthTypeYandexServiceAccount,
 		SecretsTypeYandexLockbox,
 		TemplateTypeYandexServerlessContainer,
+		TemplateTypeYandexStaticWebsite,
 		ResourceTypeObjectStorageBucket,
 		RegistrarTypeYandexDns,
 	} {

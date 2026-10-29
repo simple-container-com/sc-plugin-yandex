@@ -24,6 +24,10 @@ The plugin advertises a schema (`SCCloudPlugin.Schema`) and SC core routes resou
 - `yc-bucket` ComputeProcessor — same input-serialization gap.
 - `yc-object-storage` state store (`InitStateStore` RPC). The lifted `InitStateStore` function is at `plugin/internal/provider.go:38`. The RPC request already carries a config map, so this is straightforward wire-up.
 
+## Plugin-bus inputs are JSON-encoded, then YAML-decoded
+
+Core serialises a resource's config with `encoding/json`; `decodeInputsAs` decodes it through YAML. A config struct whose field has different json and yaml names arrives empty without an error — the classic case is `json:",inline"` on a NAMED field (encoding/json nests it, YAML flattens it). Give every field of an input struct identical json/yaml tags, and add a JSON→YAML round-trip test (see `api/static_website_test.go`).
+
 ## Known Yandex Cloud quirks worth re-reading
 
 Before deploying ANYTHING to Yandex Cloud, open `forge/CLAUDE.md` §"Yandex Cloud: a green deploy is not a running container". The headlines:
