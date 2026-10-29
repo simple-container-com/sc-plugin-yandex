@@ -404,3 +404,19 @@ func TestServerlessContainer_ComputeContextEnvReachesContainer(t *testing.T) {
 	Expect(env).ToNot(HaveKey(resource.PropertyKey("MONGO_URI")), "a secret must not be inlined into the container env")
 	Expect(mocks.countOf(tokenLockboxVersion)).To(Equal(1))
 }
+
+// A domain with no registrar used to be a nil interface call that killed the
+// plugin process (sc-plugin-yandex v2026.10.29-b913f2a). It must be an error,
+// raised before the first resource is registered.
+func TestServerlessContainer_DomainWithoutRegistrarIsAnError(t *testing.T) {
+	RegisterTestingT(t)
+
+	cfg := baseContainerInput()
+	cfg.StackConfig.Domain = "app.simple-forge.ru"
+	mocks := newBucketMocks()
+	err := provisionContainer(cfg, mocks)
+	Expect(err).To(MatchError(ContainSubstring(`domain "app.simple-forge.ru"`)))
+	Expect(err).To(MatchError(ContainSubstring("no registrar serving it")))
+	Expect(mocks.countOf(tokenContainer)).To(Equal(0))
+	Expect(mocks.countOf(tokenDockerImage)).To(Equal(0))
+}

@@ -104,6 +104,15 @@ func ServerlessContainer(ctx *sdk.Context, stack api.Stack, input api.ResourceIn
 	if crInput.FolderID == "" {
 		return nil, errors.Errorf("folderId must be set for serverless container in stack %q", stack.Name)
 	}
+	if crInput.StackConfig.Domain != "" && params.Registrar == nil {
+		// Checked before anything is registered: discovering it after the image
+		// push and the container create would leave a half-built stack, and
+		// calling through the nil registrar panics the whole plugin process
+		// (sc-plugin-yandex v2026.10.29-b913f2a, two-peaks run 40914703224).
+		return nil, errors.Errorf("domain %q is set for serverless container in stack %q, but no registrar serving it was supplied: "+
+			"the domain needs a %s registrar for its zone, initialised by SC core in this deploy before the container is provisioned",
+			crInput.StackConfig.Domain, stack.Name, yandex.RegistrarTypeYandexDns)
+	}
 
 	stackConfig := crInput.StackConfig
 	if stackConfig.Image == nil {
