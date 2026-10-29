@@ -113,8 +113,13 @@ func (p *ycPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.Re
 	if h.GetMonitorAddress() == "" {
 		return nil, nil, errors.New("no monitor address in request header")
 	}
+	engineAddr, err := engineAddress(h.GetEngineAddress(), p.progress)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "start local pulumi engine endpoint")
+	}
 	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
 		MonitorAddr: h.GetMonitorAddress(),
+		EngineAddr:  engineAddr,
 		Project:     h.GetProjectName(),
 		Stack:       h.GetStackName(),
 	})
@@ -366,6 +371,15 @@ func (p *ycPlugin) provisionServerlessContainer(pctx *sdk.Context, req *scplugin
 	}
 	urn := waitForComposite(out.Ref)
 	p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
+	// The ctx.Export of the container URL lands on this plugin's own Context, which
+	// never registers stack outputs — so without this line the deploy log names no
+	// URL at all, and a stack without `domain:` (served on its
+	// *.containers.yandexcloud.net endpoint) has no way to find where it lives.
+	if sc, ok := out.Ref.(*ycInternal.ServerlessContainerOutput); ok && sc.Container != nil {
+		if u := waitForRef(sc.Container.Url); u != "" {
+			p.progress.Info("serverless-container", fmt.Sprintf("container %q is served at %s", req.GetResourceName(), u))
+		}
+	}
 	return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 }
 
