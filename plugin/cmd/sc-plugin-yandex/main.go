@@ -36,6 +36,7 @@ import (
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 
 	ycApi "github.com/simple-container-com/sc-plugin-yandex/api"
 	ycInternal "github.com/simple-container-com/sc-plugin-yandex/plugin/internal"
@@ -113,45 +114,30 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 	}, nil
 }
 
-// pulumiContextFromHeader opens the handler's Pulumi context. The returned
-// done func must run before the handler responds (handlers defer settle with
-// it): it waits for every registration the handler started, then closes the
-// context.
-func (p *ycPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, func() error, error) {
+// pulumiContextFromHeader opens the handler's Pulumi context via the shared
+// api/pkg/plugin/runtime library (yandex's own pre-split helpers moved there
+// unchanged: pulumi_wait.go via go:linkname, engine.go for the local Engine
+// fallback). Handlers call runtime.Settle on the returned Context before
+// responding to drain pending registrations.
+//
+// The newPulumiContext field remains the test seam — provision_test.go sets
+// it to open a context over Pulumi mocks. Passed through as WithContextFactory.
+func (p *ycPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.RequestHeader) (*runtime.Context, error) {
+	opts := []runtime.ContextOption{runtime.WithLocalEngineFallback(p.progress)}
 	if p.newPulumiContext != nil {
-		pctx, err := p.newPulumiContext(ctx, h)
-		if err != nil {
-			return nil, nil, err
-		}
-		return pctx, func() error { return finishPulumiContext(pctx) }, nil
+		opts = append(opts, runtime.WithContextFactory(p.newPulumiContext))
 	}
-	if h.GetMonitorAddress() == "" {
-		return nil, nil, errors.New("no monitor address in request header")
-	}
-	engineAddr, err := engineAddress(h.GetEngineAddress(), p.progress)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "start local pulumi engine endpoint")
-	}
-	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
-		MonitorAddr: h.GetMonitorAddress(),
-		EngineAddr:  engineAddr,
-		Project:     h.GetProjectName(),
-		Stack:       h.GetStackName(),
-	})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
-	}
-	return pctx, func() error { return finishPulumiContext(pctx) }, nil
+	return runtime.NewContext(ctx, h, opts...)
 }
 
 func (p *ycPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.ProvisionRegistrarRequest) (resp *scpluginv1.ProvisionRegistrarResponse, err error) {
 	p.progress.Info("provision-registrar", fmt.Sprintf("initialising yandex registrar for zone %q", strVal(req.GetConfig()["zoneName"])))
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
-	return p.provisionRegistrar(pctx, req)
+	defer runtime.Settle(rctx, &resp, &err)
+	return p.provisionRegistrar(rctx.Pulumi, req)
 }
 
 func (p *ycPlugin) provisionRegistrar(pctx *sdk.Context, req *scpluginv1.ProvisionRegistrarRequest) (*scpluginv1.ProvisionRegistrarResponse, error) {
@@ -176,17 +162,17 @@ func (p *ycPlugin) provisionRegistrar(pctx *sdk.Context, req *scpluginv1.Provisi
 }
 
 func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecordRequest) (resp *scpluginv1.NewDnsRecordResponse, err error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
+	defer runtime.Settle(rctx, &resp, &err)
 	r := p.registrarFor(req.GetRecordName())
 	if r == nil {
 		return nil, errors.New("NewDnsRecord called before ProvisionRegistrar")
 	}
 	p.progress.Info("dns-record", fmt.Sprintf("creating %s record %q → %q", req.GetRecordType(), req.GetRecordName(), req.GetValueResolved()))
-	out, err := r.NewRecord(pctx, api.DnsRecord{
+	out, err := r.NewRecord(rctx.Pulumi, api.DnsRecord{
 		Name:    req.GetRecordName(),
 		Type:    req.GetRecordType(),
 		Value:   req.GetValueResolved(),
@@ -202,11 +188,11 @@ func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecor
 }
 
 func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.NewOverrideHeaderRuleRequest) (resp *scpluginv1.NewOverrideHeaderRuleResponse, err error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
+	defer runtime.Settle(rctx, &resp, &err)
 	r := p.registrarFor(req.GetFromHost())
 	if r == nil {
 		return nil, errors.New("NewOverrideHeaderRule called before ProvisionRegistrar")
@@ -224,7 +210,7 @@ func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.Ne
 		rule.OverridePages = &pApi.OverridePagesRule{IndexPage: op.GetIndexPage(), NotFoundPage: op.GetNotFoundPage()}
 	}
 	p.progress.Info("worker-route", fmt.Sprintf("overriding host %q → %q (rule %q)", rule.FromHost, req.GetToHostResolved(), rule.Name))
-	out, err := r.NewOverrideHeaderRule(pctx, api.Stack{Name: req.GetStackName()}, rule)
+	out, err := r.NewOverrideHeaderRule(rctx.Pulumi, api.Stack{Name: req.GetStackName()}, rule)
 	if err != nil {
 		p.progress.Error("worker-route", fmt.Sprintf("rule %q failed: %v", rule.Name, err))
 		return nil, err
@@ -235,11 +221,11 @@ func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.Ne
 }
 
 func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scpluginv1.ProvisionDomainForEndpointRequest) (resp *scpluginv1.ProvisionDomainForEndpointResponse, err error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
+	defer runtime.Settle(rctx, &resp, &err)
 	r := p.registrarFor(req.GetDomain())
 	if r == nil {
 		return nil, errors.New("ProvisionDomainForEndpoint called before ProvisionRegistrar")
@@ -251,7 +237,7 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 		WebSocket:  req.GetWebsocket(),
 	}
 	p.progress.Info("endpoint", fmt.Sprintf("provisioning domain %q for endpoint %q (target %q)", endpoint.Domain, endpoint.Name, req.GetTargetHostResolved()))
-	out, err := r.ProvisionDomainForEndpoint(pctx, api.Stack{Name: req.GetStackName()}, endpoint)
+	out, err := r.ProvisionDomainForEndpoint(rctx.Pulumi, api.Stack{Name: req.GetStackName()}, endpoint)
 	if err != nil {
 		p.progress.Error("endpoint", fmt.Sprintf("endpoint %q failed: %v", endpoint.Name, err))
 		return nil, err
@@ -266,11 +252,11 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 // and threads it into every downstream Provision call via
 // RequestHeader.provider_urns.
 func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (resp *scpluginv1.ProviderResponse, err error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
+	defer runtime.Settle(rctx, &resp, &err)
 	var acct ycApi.AccountConfig
 	if err := decodeInputsAs(req.GetInputs(), &acct); err != nil {
 		return nil, errors.Wrap(err, "decode provider auth config")
@@ -284,7 +270,7 @@ func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest
 		StackParams: &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()},
 	}
 	p.progress.Info("provider", fmt.Sprintf("initialising yandex provider %q (folder=%q)", req.GetProviderResourceName(), acct.FolderID))
-	out, err := ycInternal.Provider(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
+	out, err := ycInternal.Provider(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
 	if err != nil {
 		p.progress.Error("provider", fmt.Sprintf("provider init failed: %v", err))
 		return nil, errors.Wrap(err, "init yandex provider")
@@ -305,11 +291,11 @@ func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest
 // is the folder id — identical to pre-split, so the URN is byte-
 // identical and no state replace+create fires on first plugin-era deploy.
 func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (resp *scpluginv1.ProvisionResponse, err error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
+	defer runtime.Settle(rctx, &resp, &err)
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
 	stackParams := &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()}
 	switch req.GetResourceType() {
@@ -318,7 +304,7 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
 			return nil, errors.Wrap(err, "decode bucket config")
 		}
-		provider, err := p.buildProvider(pctx, &bucket.AccountConfig, "bucket", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+		provider, err := p.buildProvider(rctx.Pulumi, &bucket.AccountConfig, "bucket", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
 		if err != nil {
 			return nil, err
 		}
@@ -327,7 +313,7 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			StackParams: stackParams,
 		}
 		p.progress.Info("bucket", fmt.Sprintf("provisioning object-storage bucket %q", req.GetResourceName()))
-		out, err := ycInternal.ObjectStorageBucket(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		out, err := ycInternal.ObjectStorageBucket(rctx.Pulumi, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
 		if err != nil {
 			p.progress.Error("bucket", fmt.Sprintf("bucket %q failed: %v", req.GetResourceName(), err))
 			return nil, err
@@ -336,7 +322,7 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
-		return p.provisionServerlessContainer(pctx, req)
+		return p.provisionServerlessContainer(rctx.Pulumi, req)
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
 	}
@@ -437,25 +423,31 @@ func (p *ycPlugin) buildProvider(pctx *sdk.Context, acct *ycApi.AccountConfig, p
 // SC core calls this during dependency resolution so the downstream
 // serverless-container can see the bucket env vars.
 func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (resp *scpluginv1.ComputeProcessResponse, err error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer settle(done, &resp, &err)
+	defer runtime.Settle(rctx, &resp, &err)
 	if req.GetResourceType() != ycApi.ResourceTypeObjectStorageBucket {
 		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
+	}
+	// Decode parent env for the StackParams swap: on an isolated-stack
+	// consumer (e.g. forge-storage preview on a wf-id env), the bucket
+	// exists in the PARENT's env and the compute-processor must look it
+	// up under that name, not the child env. Same shape as the aws and
+	// mongodb plugin ComputeProcess handlers (sc-plugin-aws v2026.11.01-92f5d1b).
+	parent, err := runtime.ParentInfoFromRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	var bucket ycApi.ObjectStorageBucket
 	if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
 		return nil, errors.Wrap(err, "decode bucket config for compute-process")
 	}
-	input := api.ResourceInput{
-		Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &bucket}},
-		StackParams: &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()},
-	}
+	input := runtime.ResourceInputForComputeProcess(req, parent, &bucket)
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
 	p.progress.Info("compute-process", fmt.Sprintf("compute-processing bucket %q", req.GetResourceName()))
-	out, err := ycInternal.ObjectStorageBucketComputeProcessor(pctx, stack, input, nil, pApi.ProvisionParams{Log: logger.New()})
+	out, err := ycInternal.ObjectStorageBucketComputeProcessor(rctx.Pulumi, stack, input, nil, pApi.ProvisionParams{Log: logger.New()})
 	if err != nil {
 		return nil, err
 	}
