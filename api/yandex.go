@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-
 	"github.com/simple-container-com/api/pkg/api"
 )
 

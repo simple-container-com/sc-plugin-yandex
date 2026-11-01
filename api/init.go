@@ -16,7 +16,9 @@ func init() {
 		AuthTypeYandexServiceAccount:          ReadAuthServiceAccountConfig,
 		SecretsTypeYandexLockbox:              ReadSecretsConfig,
 		TemplateTypeYandexServerlessContainer: ReadTemplateConfig,
+		TemplateTypeStaticWebsite:             ReadStaticWebsiteConfig,
 		ResourceTypeObjectStorageBucket:       ReadObjectStorageBucketConfig,
+		ResourceTypeWildcardCert:              ReadWildcardCertConfig,
 		RegistrarTypeYandexDns:                ReadRegistrarConfig,
 	})
 
@@ -26,11 +28,15 @@ func init() {
 	})
 
 	// A Serverless Container is the fleet's Lambda replacement, so it converts
-	// from a single-image client stack. There is deliberately no compose or
-	// static-site converter yet: neither has a YC shape decided (see the design
-	// doc's open question on API Gateway).
+	// from a single-image client stack. There is deliberately no compose
+	// converter yet.
 	api.RegisterCloudSingleImageConverter(api.CloudSingleImageConfigRegister{
 		TemplateTypeYandexServerlessContainer: ToServerlessContainerConfig,
+	})
+
+	// Static-site converter — `type: static` + `template: yc-static-site`.
+	api.RegisterCloudStaticSiteConverter(api.CloudStaticSiteConfigRegister{
+		TemplateTypeStaticWebsite: ToStaticWebsiteConfig,
 	})
 
 	// Fool-protection: when SC core has dropped the in-tree yandex
@@ -45,7 +51,9 @@ func init() {
 			ProviderType,                          // "yandex" — the pulumi provider
 			RegistrarTypeYandexDns,                // "yc-dns"
 			ResourceTypeObjectStorageBucket,       // "yc-bucket"
+			ResourceTypeWildcardCert,              // "yc-wildcard-cert"
 			TemplateTypeYandexServerlessContainer, // "yc-serverless-container"
+			TemplateTypeStaticWebsite,             // "yc-static-website"
 			StateStorageTypeYandexObjectStorage,   // "yc-object-storage" (state backend)
 			SecretsProviderTypeYandexKms,          // "yc-kms" (secrets provider)
 			SecretsTypeYandexLockbox,              // "yc-lockbox" (runtime secret store)

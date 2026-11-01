@@ -103,9 +103,17 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 		// re-runs Provider inside each Provision instead: the URN stays
 		// byte-identical (same name, same provider version), and the
 		// bucket resource gets a live ProviderResource in the SAME pctx.
-		RegistrarTypes:        []string{ycApi.RegistrarTypeYandexDns},
-		ResourceTypes:         []string{ycApi.ResourceTypeObjectStorageBucket, ycApi.TemplateTypeYandexServerlessContainer},
-		ComputeProcessorTypes: []string{ycApi.ResourceTypeObjectStorageBucket},
+		RegistrarTypes: []string{ycApi.RegistrarTypeYandexDns},
+		ResourceTypes: []string{
+			ycApi.ResourceTypeObjectStorageBucket,
+			ycApi.ResourceTypeWildcardCert,
+			ycApi.TemplateTypeYandexServerlessContainer,
+			ycApi.TemplateTypeStaticWebsite,
+		},
+		ComputeProcessorTypes: []string{
+			ycApi.ResourceTypeObjectStorageBucket,
+			ycApi.ResourceTypeWildcardCert,
+		},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
 			// terraform-provider-yandex (pulumi/pulumi-yandex is archived at v0.13.0).
@@ -323,9 +331,88 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
 		return p.provisionServerlessContainer(rctx.Pulumi, req)
+	case ycApi.ResourceTypeWildcardCert:
+		return p.provisionWildcardCert(ctx, rctx.Pulumi, req, stack, stackParams)
+	case ycApi.TemplateTypeStaticWebsite:
+		return p.provisionStaticWebsite(ctx, rctx.Pulumi, req, stack, stackParams)
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise resource type %q", req.GetResourceType())
 	}
+}
+
+// provisionWildcardCert dispatches the yc-wildcard-cert resource to its
+// driver. Opens the plugin's own provider against the cert's AccountConfig
+// so the cert + ACME recordset are provisioned in the operator's folder,
+// not whatever provider SC core happened to seed on this handler.
+//
+// The response carries runtime.HarvestExports output as ProvisionResponse.Outputs
+// so SC core re-exports the cert id onto the parent stack root for `uses:`
+// consumers (trap 3 — api PR #527 plumbing).
+func (p *ycPlugin) provisionWildcardCert(stdctx context.Context, pctx *sdk.Context, req *scpluginv1.ProvisionRequest, stack api.Stack, stackParams *api.StackParams) (*scpluginv1.ProvisionResponse, error) {
+	var cfg ycApi.WildcardCertConfig
+	if err := decodeInputsAs(req.GetInputs(), &cfg); err != nil {
+		return nil, errors.Wrap(err, "decode yc-wildcard-cert config")
+	}
+	input := api.ResourceInput{
+		Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &cfg}},
+		StackParams: stackParams,
+	}
+	p.progress.Info("wildcard-cert", fmt.Sprintf("provisioning yc-wildcard-cert %q for zone %q", req.GetResourceName(), cfg.ZoneName))
+	out, err := ycInternal.WildcardCert(pctx, stack, input, pApi.ProvisionParams{Log: logger.New()})
+	if err != nil {
+		p.progress.Error("wildcard-cert", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
+	urn := waitForComposite(out.Ref)
+	outputs, err := runtime.HarvestExports(stdctx, pctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "harvest yc-wildcard-cert exports")
+	}
+	p.progress.Info("wildcard-cert", fmt.Sprintf("yc-wildcard-cert %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
+	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
+}
+
+// provisionStaticWebsite dispatches the yc-static-website template to its
+// driver. The template reads the shared wildcard cert id via a parent
+// StackReference (see static_website.go's SharedCertResource handling).
+func (p *ycPlugin) provisionStaticWebsite(stdctx context.Context, pctx *sdk.Context, req *scpluginv1.ProvisionRequest, stack api.Stack, stackParams *api.StackParams) (*scpluginv1.ProvisionResponse, error) {
+	var cfg ycApi.StaticWebsiteInput
+	if err := decodeInputsAs(req.GetInputs(), &cfg); err != nil {
+		return nil, errors.Wrap(err, "decode yc-static-website config")
+	}
+	provider, err := p.buildProvider(pctx, &cfg.AccountConfig, "static-website", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+	if err != nil {
+		return nil, err
+	}
+	input := api.ResourceInput{
+		Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &cfg}},
+		StackParams: stackParams,
+	}
+	// Pick the registrar whose zone serves this stack's domain. Required —
+	// the static-site driver creates one DNS record (CNAME or ANAME) via
+	// the registrar's NewRecord.
+	registrar := p.registrarForDomain(cfg.EffectiveDomain())
+	if registrar == nil {
+		return nil, errors.Errorf("no yc-dns registrar initialised that serves %q — add a yc-dns registrar for that zone to the parent server.yaml", cfg.EffectiveDomain())
+	}
+	p.progress.Info("static-website", fmt.Sprintf("provisioning yc-static-website %q for domain %q", req.GetResourceName(), cfg.EffectiveDomain()))
+	out, err := ycInternal.StaticWebsite(pctx, stack, input, pApi.ProvisionParams{
+		Log:            logger.New(),
+		Provider:       provider,
+		ComputeContext: computeContextFromRequest(pctx, req),
+		Registrar:      registrar,
+	})
+	if err != nil {
+		p.progress.Error("static-website", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
+	urn := waitForComposite(out.Ref)
+	outputs, err := runtime.HarvestExports(stdctx, pctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "harvest yc-static-website exports")
+	}
+	p.progress.Info("static-website", fmt.Sprintf("yc-static-website %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
+	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
 }
 
 // provisionServerlessContainer is the yc-serverless-container branch of
@@ -428,9 +515,6 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 		return nil, err
 	}
 	defer runtime.Settle(rctx, &resp, &err)
-	if req.GetResourceType() != ycApi.ResourceTypeObjectStorageBucket {
-		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
-	}
 	// Decode parent env for the StackParams swap: on an isolated-stack
 	// consumer (e.g. forge-storage preview on a wf-id env), the bucket
 	// exists in the PARENT's env and the compute-processor must look it
@@ -440,19 +524,43 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 	if err != nil {
 		return nil, err
 	}
-	var bucket ycApi.ObjectStorageBucket
-	if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
-		return nil, errors.Wrap(err, "decode bucket config for compute-process")
-	}
-	input := runtime.ResourceInputForComputeProcess(req, parent, &bucket)
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
-	p.progress.Info("compute-process", fmt.Sprintf("compute-processing bucket %q", req.GetResourceName()))
-	out, err := ycInternal.ObjectStorageBucketComputeProcessor(rctx.Pulumi, stack, input, nil, pApi.ProvisionParams{Log: logger.New()})
-	if err != nil {
-		return nil, err
+	collector := newCapturingCollector()
+	provisionParams := pApi.ProvisionParams{Log: logger.New(), ParentStack: parent}
+	switch req.GetResourceType() {
+	case ycApi.ResourceTypeObjectStorageBucket:
+		var bucket ycApi.ObjectStorageBucket
+		if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
+			return nil, errors.Wrap(err, "decode bucket config for compute-process")
+		}
+		input := runtime.ResourceInputForComputeProcess(req, parent, &bucket)
+		p.progress.Info("compute-process", fmt.Sprintf("compute-processing bucket %q", req.GetResourceName()))
+		out, err := ycInternal.ObjectStorageBucketComputeProcessor(rctx.Pulumi, stack, input, collector, provisionParams)
+		if err != nil {
+			return nil, err
+		}
+		urn := waitForComposite(out.Ref)
+		resp := collector.ToResponse()
+		resp.Urn = urn
+		return resp, nil
+	case ycApi.ResourceTypeWildcardCert:
+		var cfg ycApi.WildcardCertConfig
+		if err := decodeInputsAs(req.GetInputs(), &cfg); err != nil {
+			return nil, errors.Wrap(err, "decode yc-wildcard-cert config for compute-process")
+		}
+		input := runtime.ResourceInputForComputeProcess(req, parent, &cfg)
+		p.progress.Info("compute-process", fmt.Sprintf("compute-processing yc-wildcard-cert %q", req.GetResourceName()))
+		out, err := ycInternal.WildcardCertComputeProcessor(rctx.Pulumi, stack, input, collector, provisionParams)
+		if err != nil {
+			return nil, err
+		}
+		urn := waitForComposite(out.Ref)
+		resp := collector.ToResponse()
+		resp.Urn = urn
+		return resp, nil
+	default:
+		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
 	}
-	urn := waitForComposite(out.Ref)
-	return &scpluginv1.ComputeProcessResponse{Urn: urn}, nil
 }
 
 // InitStateStore — pre-engine. The sidecar on SC core calls this and

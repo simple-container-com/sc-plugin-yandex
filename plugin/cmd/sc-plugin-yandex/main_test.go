@@ -8,11 +8,9 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-	"github.com/samber/lo"
-
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
+	"github.com/samber/lo"
 	"github.com/simple-container-com/api/pkg/api"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
 

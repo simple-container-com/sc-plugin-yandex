@@ -8,7 +8,6 @@ import (
 	"net/url"
 
 	"github.com/samber/lo"
-
 	"github.com/simple-container-com/api/pkg/api"
 )
 

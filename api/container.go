@@ -5,7 +5,6 @@ package yandex
 
 import (
 	"github.com/pkg/errors"
-
 	"github.com/simple-container-com/api/pkg/api"
 )
 

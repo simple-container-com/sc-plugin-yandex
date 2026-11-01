@@ -9,7 +9,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	. "github.com/onsi/gomega"
-
 	"github.com/simple-container-com/api/pkg/api"
 )
 
