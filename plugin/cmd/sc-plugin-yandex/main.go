@@ -90,11 +90,17 @@ func (p *ycPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.Re
 
 func (p *ycPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.ProvisionRegistrarRequest) (*scpluginv1.ProvisionRegistrarResponse, error) {
 	p.progress.Info("provision-registrar", fmt.Sprintf("initialising yandex registrar for zone %q", strVal(req.GetConfig()["zoneName"])))
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 
 	cfg := inputsToRegistrarConfig(req.GetConfig())
 	desc := api.RegistrarDescriptor{
@@ -115,11 +121,17 @@ func (p *ycPlugin) ProvisionRegistrar(ctx context.Context, req *scpluginv1.Provi
 }
 
 func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecordRequest) (*scpluginv1.NewDnsRecordResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 	p.mu.Lock()
 	r := p.registrar
 	p.mu.Unlock()
@@ -143,11 +155,17 @@ func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecor
 }
 
 func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.NewOverrideHeaderRuleRequest) (*scpluginv1.NewOverrideHeaderRuleResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 	p.mu.Lock()
 	r := p.registrar
 	p.mu.Unlock()
@@ -178,11 +196,17 @@ func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.Ne
 }
 
 func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scpluginv1.ProvisionDomainForEndpointRequest) (*scpluginv1.ProvisionDomainForEndpointResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 	p.mu.Lock()
 	r := p.registrar
 	p.mu.Unlock()
@@ -211,11 +235,17 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 // and threads it into every downstream Provision call via
 // RequestHeader.provider_urns.
 func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (*scpluginv1.ProviderResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 	var acct ycApi.AccountConfig
 	if err := decodeInputsAs(req.GetInputs(), &acct); err != nil {
 		return nil, errors.Wrap(err, "decode provider auth config")
@@ -250,11 +280,17 @@ func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest
 // is the folder id — identical to pre-split, so the URN is byte-
 // identical and no state replace+create fires on first plugin-era deploy.
 func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
 	stackParams := &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()}
 	switch req.GetResourceType() {
@@ -346,11 +382,17 @@ func (p *ycPlugin) buildProvider(pctx *sdk.Context, acct *ycApi.AccountConfig, p
 // SC core calls this during dependency resolution so the downstream
 // serverless-container can see the bucket env vars.
 func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — closing it cuts off in-flight RegisterResource
+	// RPCs that Pulumi's background goroutines were about to make, which
+	// drops the plugin's URN registrations and plans a destroy of every
+	// pre-existing state entry. The cascade pattern Addendum U/V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Mongodb hit this and lost the fleet's shared Atlas
+	// project on 2026-10-31T11:07.
 	if req.GetResourceType() != ycApi.ResourceTypeObjectStorageBucket {
 		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
 	}
