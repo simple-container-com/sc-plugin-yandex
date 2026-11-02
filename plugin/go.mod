@@ -11,7 +11,7 @@ require (
 	github.com/pulumi/pulumi-docker/sdk/v4 v4.11.2
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261102104601-6cb66e285422
+	github.com/simple-container-com/api v0.0.0-20261102142605-7a84b47744bf
 	github.com/simple-container-com/pulumi-yandex/sdk v1.1.0
 	github.com/simple-container-com/sc-plugin-yandex/api v0.0.0-20261101233310-67602079742f
 	github.com/spf13/afero v1.15.0
