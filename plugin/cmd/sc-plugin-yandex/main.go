@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -564,6 +565,82 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 	resp.Urn = waitForComposite(out.Ref)
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
+}
+
+// ConvertStackConfig is the plugin-side half of SC core's A2 path
+// for plugin-owned template types. Dispatches on template_type to
+// the right ToXxxConfig closure, marshals the typed Input back as
+// an InputValue tree, and lifts the three structured fields SC core
+// wraps in pluginPreparedInput (base_dns_zone, uses,
+// depends_on_resources). yandex's StackConfigCompose converter does
+// not exist today — only single-image (yc-container) and static
+// (yc-static-site). A branch for compose is reserved for whenever
+// the compose variant lands.
+func (p *ycPlugin) ConvertStackConfig(_ context.Context, req *scpluginv1.ConvertStackConfigRequest) (*scpluginv1.ConvertStackConfigResponse, error) {
+	templateType := req.GetTemplateType()
+	stackName := req.GetStackName()
+	stackDir := req.GetStackDir()
+	p.progress.Info("convert-stack-config", fmt.Sprintf("template=%q stack=%q", templateType, stackName))
+
+	tplCfg := &ycApi.TemplateConfig{}
+	if err := yamlRoundTrip(scPlugin.InputsToPlain(req.GetTemplateConfig()), tplCfg); err != nil {
+		return nil, errors.Wrapf(err, "decode template_config for %q", templateType)
+	}
+
+	stackPlain := scPlugin.InputsToPlain(req.GetStackConfig())
+	var typedInput any
+	var cerr error
+	switch templateType {
+	case ycApi.TemplateTypeYandexServerlessContainer:
+		stackCfg := &api.StackConfigSingleImage{}
+		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+			return nil, errors.Wrap(err, "decode StackConfigSingleImage")
+		}
+		typedInput, cerr = ycApi.ToServerlessContainerConfig(tplCfg, stackCfg)
+	case ycApi.TemplateTypeStaticWebsite:
+		stackCfg := &api.StackConfigStatic{}
+		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+			return nil, errors.Wrap(err, "decode StackConfigStatic")
+		}
+		typedInput, cerr = ycApi.ToStaticWebsiteConfig(tplCfg, stackDir, stackName, stackCfg)
+	default:
+		return nil, errors.Errorf("sc-plugin-yandex does not own template type %q", templateType)
+	}
+	if cerr != nil {
+		return nil, errors.Wrapf(cerr, "convert %q for stack %q", templateType, stackName)
+	}
+
+	resp := &scpluginv1.ConvertStackConfigResponse{
+		Input: scPlugin.PlainToInputs(typedInput),
+	}
+	if dca, ok := typedInput.(api.DnsConfigAware); ok {
+		resp.BaseDnsZone = dca.OverriddenBaseZone()
+	}
+	if ra, ok := typedInput.(api.ResourceAware); ok {
+		resp.Uses = ra.Uses()
+	}
+	if wdr, ok := typedInput.(api.WithDependsOnResources); ok {
+		for _, dep := range wdr.DependsOnResources() {
+			raw, jerr := json.Marshal(dep)
+			if jerr != nil {
+				return nil, errors.Wrap(jerr, "marshal depends-on entry")
+			}
+			resp.DependsOnResourcesJson = append(resp.DependsOnResourcesJson, raw)
+		}
+	}
+	return resp, nil
+}
+
+// yamlRoundTrip decodes a plain map[string]any (what InputsToPlain
+// returns from the bus's InputValue tree) into a typed struct via a
+// YAML round-trip. Same shape pApi.ConvertConfig uses, lifted locally
+// so this handler does not reach into pkg/api private helpers.
+func yamlRoundTrip(src any, out any) error {
+	b, err := yaml.Marshal(src)
+	if err != nil {
+		return err
+	}
+	return yaml.Unmarshal(b, out)
 }
 
 // InitStateStore — pre-engine. The sidecar on SC core calls this and
