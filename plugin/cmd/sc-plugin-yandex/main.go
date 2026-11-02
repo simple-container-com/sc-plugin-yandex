@@ -399,7 +399,7 @@ func (p *ycPlugin) provisionStaticWebsite(stdctx context.Context, pctx *sdk.Cont
 	out, err := ycInternal.StaticWebsite(pctx, stack, input, pApi.ProvisionParams{
 		Log:            logger.New(),
 		Provider:       provider,
-		ComputeContext: computeContextFromRequest(pctx, req),
+		ComputeContext: runtime.NewProvisionCollector(req),
 		Registrar:      registrar,
 	})
 	if err != nil {
@@ -450,7 +450,7 @@ func (p *ycPlugin) provisionServerlessContainer(pctx *sdk.Context, req *scplugin
 	out, err := ycInternal.ServerlessContainer(pctx, stack, input, pApi.ProvisionParams{
 		Log:            logger.New(),
 		Provider:       provider,
-		ComputeContext: computeContextFromRequest(pctx, req),
+		ComputeContext: runtime.NewProvisionCollector(req),
 		Registrar:      registrar,
 	})
 	if err != nil {
@@ -525,42 +525,45 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 		return nil, err
 	}
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
-	collector := newCapturingCollector()
 	provisionParams := pApi.ProvisionParams{Log: logger.New(), ParentStack: parent}
+	// runtime.RunComputeProcess owns the fn → drain → marshal sequence.
+	// ObjectStorageBucketComputeProcessor builds every S3_* env var from
+	// INSIDE an ApplyT on the parent bucket ref; the shared Collector
+	// captures that output and awaitOutputs drains it before marshalling.
+	// Previously the per-plugin collector had AddOutput as a no-op, so
+	// those mutations would have silently been dropped — same shape as
+	// the sc-plugin-aws trap-16 incident (agent-native-pdf-rendering run
+	// f4355798, 2026-11-02). This path was latent only because no stack
+	// currently declares uses: [<yc-bucket>].
+	var handler runtime.ComputeProcessHandler
+	var input api.ResourceInput
 	switch req.GetResourceType() {
 	case ycApi.ResourceTypeObjectStorageBucket:
 		var bucket ycApi.ObjectStorageBucket
 		if err := decodeInputsAs(req.GetInputs(), &bucket); err != nil {
 			return nil, errors.Wrap(err, "decode bucket config for compute-process")
 		}
-		input := runtime.ResourceInputForComputeProcess(req, parent, &bucket)
+		input = runtime.ResourceInputForComputeProcess(req, parent, &bucket)
 		p.progress.Info("compute-process", fmt.Sprintf("compute-processing bucket %q", req.GetResourceName()))
-		out, err := ycInternal.ObjectStorageBucketComputeProcessor(rctx.Pulumi, stack, input, collector, provisionParams)
-		if err != nil {
-			return nil, err
-		}
-		urn := waitForComposite(out.Ref)
-		resp := collector.ToResponse()
-		resp.Urn = urn
-		return resp, nil
+		handler = ycInternal.ObjectStorageBucketComputeProcessor
 	case ycApi.ResourceTypeWildcardCert:
 		var cfg ycApi.WildcardCertConfig
 		if err := decodeInputsAs(req.GetInputs(), &cfg); err != nil {
 			return nil, errors.Wrap(err, "decode yc-wildcard-cert config for compute-process")
 		}
-		input := runtime.ResourceInputForComputeProcess(req, parent, &cfg)
+		input = runtime.ResourceInputForComputeProcess(req, parent, &cfg)
 		p.progress.Info("compute-process", fmt.Sprintf("compute-processing yc-wildcard-cert %q", req.GetResourceName()))
-		out, err := ycInternal.WildcardCertComputeProcessor(rctx.Pulumi, stack, input, collector, provisionParams)
-		if err != nil {
-			return nil, err
-		}
-		urn := waitForComposite(out.Ref)
-		resp := collector.ToResponse()
-		resp.Urn = urn
-		return resp, nil
+		handler = ycInternal.WildcardCertComputeProcessor
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
 	}
+	resp, out, err := runtime.RunComputeProcess(ctx, rctx, stack, input, provisionParams, handler)
+	if err != nil {
+		return nil, err
+	}
+	resp.Urn = waitForComposite(out.Ref)
+	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
+	return resp, nil
 }
 
 // InitStateStore — pre-engine. The sidecar on SC core calls this and
@@ -597,28 +600,6 @@ func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) err
 		return err
 	}
 	return yaml.Unmarshal(bytes, out)
-}
-
-// computeContextFromRequest rebuilds the compute context SC core collected from
-// the consuming stack's `uses:` resources (ProvisionRequest.compute_env_vars), so
-// the plugin's compute template sees the env an in-tree template reads from
-// params.ComputeContext. Dependencies() stay empty: they are sdk.Resource handles
-// of core's context and do not cross the bus. An older core sends no env, and
-// the context is simply empty — never nil, so the template cannot panic on it.
-func computeContextFromRequest(pctx *sdk.Context, req *scpluginv1.ProvisionRequest) pApi.ComputeContextCollector {
-	h := req.GetHeader()
-	collector := pApi.NewComputeContextCollector(pctx.Context(), logger.New(), h.GetStackName(), h.GetEnvironment())
-	for _, v := range req.GetComputeEnvVars() {
-		if v.GetName() == "" {
-			continue
-		}
-		if v.GetSecret() {
-			collector.AddSecretEnvVariableIfNotExist(v.GetName(), v.GetValue(), v.GetResourceType(), v.GetResourceName(), v.GetStackName())
-		} else {
-			collector.AddEnvVariableIfNotExist(v.GetName(), v.GetValue(), v.GetResourceType(), v.GetResourceName(), v.GetStackName())
-		}
-	}
-	return collector
 }
 
 func (p *ycPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1.SCCloudPlugin_LogStreamServer) error {

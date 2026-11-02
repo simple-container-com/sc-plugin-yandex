@@ -13,6 +13,7 @@ import (
 	"github.com/samber/lo"
 	"github.com/simple-container-com/api/pkg/api"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 
 	ycApi "github.com/simple-container-com/sc-plugin-yandex/api"
 )
@@ -117,43 +118,42 @@ func (noopMocks) NewResource(args sdk.MockResourceArgs) (string, resource.Proper
 
 func (noopMocks) Call(args sdk.MockCallArgs) (resource.PropertyMap, error) { return args.Args, nil }
 
-func TestComputeContextFromRequest(t *testing.T) {
+// The yandex plugin's Provision wires ProvisionRequest.compute_env_vars
+// into pApi.ProvisionParams.ComputeContext via runtime.NewProvisionCollector.
+// The pool-separation invariant (incoming env does not bleed into outgoing
+// ToResponse) lives in api/pkg/plugin/runtime TestNewProvisionCollector_SeedsIncomingPools;
+// these tests pin that the yandex plugin uses the shared helper rather than
+// the in-tree pApi.NewComputeContextCollector it previously wrapped (which
+// routed incoming vars through outgoing mutator methods — trap 14 class).
+func TestProvisionCollectorFromRequest(t *testing.T) {
 	RegisterTestingT(t)
 
-	err := sdk.RunErr(func(pctx *sdk.Context) error {
-		req := &scpluginv1.ProvisionRequest{
-			Header: &scpluginv1.RequestHeader{StackName: "backend", Environment: "staging-ru"},
-			ComputeEnvVars: []*scpluginv1.ComputeEnvVariable{
-				{Name: "MONGO_DB", Value: "app", ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
-				{Name: "MONGO_URI", Value: "mongodb+srv://u:p@h", Secret: true, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
-				{Name: "", Value: "dropped"},
-			},
-		}
-		cc := computeContextFromRequest(pctx, req)
-		Expect(cc).ToNot(BeNil())
-		Expect(cc.EnvVariables()).To(HaveLen(1))
-		Expect(cc.EnvVariables()[0].Name).To(Equal("MONGO_DB"))
-		Expect(cc.EnvVariables()[0].Value).To(Equal("app"))
-		Expect(cc.SecretEnvVariables()).To(HaveLen(1))
-		Expect(cc.SecretEnvVariables()[0].Name).To(Equal("MONGO_URI"))
-		Expect(cc.SecretEnvVariables()[0].ResourceType).To(Equal("mongodb-atlas"))
-		return nil
-	}, sdk.WithMocks("project", "stack", noopMocks{}))
-	Expect(err).ToNot(HaveOccurred())
+	req := &scpluginv1.ProvisionRequest{
+		Header: &scpluginv1.RequestHeader{StackName: "backend", Environment: "staging-ru"},
+		ComputeEnvVars: []*scpluginv1.ComputeEnvVariable{
+			{Name: "MONGO_DB", Value: "app", ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
+			{Name: "MONGO_URI", Value: "mongodb+srv://u:p@h", Secret: true, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "backend"},
+			{Name: "", Value: "dropped"},
+		},
+	}
+	cc := runtime.NewProvisionCollector(req)
+	Expect(cc).ToNot(BeNil())
+	Expect(cc.EnvVariables()).To(HaveLen(1))
+	Expect(cc.EnvVariables()[0].Name).To(Equal("MONGO_DB"))
+	Expect(cc.EnvVariables()[0].Value).To(Equal("app"))
+	Expect(cc.SecretEnvVariables()).To(HaveLen(1))
+	Expect(cc.SecretEnvVariables()[0].Name).To(Equal("MONGO_URI"))
+	Expect(cc.SecretEnvVariables()[0].ResourceType).To(Equal("mongodb-atlas"))
 }
 
 // An older SC core sends no compute env. The context must still be non-nil so
 // the template runs with an empty context instead of panicking.
-func TestComputeContextFromRequest_OlderCoreSendsNothing(t *testing.T) {
+func TestProvisionCollectorFromRequest_OlderCoreSendsNothing(t *testing.T) {
 	RegisterTestingT(t)
 
-	err := sdk.RunErr(func(pctx *sdk.Context) error {
-		cc := computeContextFromRequest(pctx, &scpluginv1.ProvisionRequest{})
-		Expect(cc).ToNot(BeNil())
-		Expect(cc.EnvVariables()).To(BeEmpty())
-		Expect(cc.SecretEnvVariables()).To(BeEmpty())
-		Expect(cc.Dependencies()).To(BeEmpty())
-		return nil
-	}, sdk.WithMocks("project", "stack", noopMocks{}))
-	Expect(err).ToNot(HaveOccurred())
+	cc := runtime.NewProvisionCollector(&scpluginv1.ProvisionRequest{})
+	Expect(cc).ToNot(BeNil())
+	Expect(cc.EnvVariables()).To(BeEmpty())
+	Expect(cc.SecretEnvVariables()).To(BeEmpty())
+	Expect(cc.Dependencies()).To(BeEmpty())
 }
