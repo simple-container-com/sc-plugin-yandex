@@ -18,14 +18,31 @@ import (
 // which would contend on a shared `_acme-challenge.<zone>` CNAME and expire
 // at ~90 days — see RegistrarConfig.CertificateID doc for the mechanism).
 //
-// There is deliberately no "shared CDN resource" sibling of this type: YC
-// Object Storage does not virtual-host arbitrary bucket names (auth.go:124),
-// and `yandex_cdn_resource` rejects `forward_host_header` + `custom_host_header`
-// at once (landing/infra/yc/main.tf:133). A shared CDN would therefore have to
-// forward every subdomain to one bucket, which is useless for multi-landing.
-// Each yc-static-website creates its own CDN resource referencing the cert
-// adopted here; YC CDN pricing is per-GB transferred, so one-CDN-per-site
-// does not change the bill.
+// There is no "shared CDN resource" sibling of this type TODAY, and the
+// decision is scoped. Shared cert makes universal sense (one DNS-01
+// challenge per zone, one managed renewal); shared CDN only makes sense
+// when the hostnames fan out to the SAME bucket. YC Object Storage does
+// not virtual-host arbitrary bucket names (auth.go:124), and
+// `yandex_cdn_resource` rejects `forward_host_header` + `custom_host_header`
+// at once (landing/infra/yc/main.tf:133). So for a MULTI-LANDING fleet
+// (apex-of-site-A + apex-of-site-B), each landing needs its own CDN
+// resource pointing at its own bucket — that case genuinely cannot share.
+//
+// For the APEX+WWW-OF-THE-SAME-SITE case (and more generally, N hostnames
+// serving the SAME content from the SAME bucket) the retired Terraform
+// shape — ONE `yandex_cdn_resource` + `secondary_hostnames: [apex, www]`
+// — is correct, and this plugin should grow a shape that supports it.
+// NOT doing so costs real money: YC CDN charges a non-refundable monthly
+// package per resource created (prepaid consumption pack, 150 GB egress +
+// 100M requests, charged in full the day the resource is created, not
+// pro-rated, no refund on delete). Running three CDN resources where one
+// with `secondary_hostnames` would do multiplies that fixed fee by 3x —
+// live-caught on simple-forge.ru 2026-11-02 (900 RUB bill against 7 MB
+// of actual transfer across three apex/www/www-sc resources).
+//
+// See forge/docs/design/2026-11-02/yc-static-website-shared-cdn/README.md
+// for the full architectural note. The shared-CDN-per-bucket shape is
+// filed as a follow-up on the yc-static-website driver.
 const ResourceTypeWildcardCert = "yc-wildcard-cert"
 
 // WildcardCertConfig describes a managed Let's Encrypt certificate for a
