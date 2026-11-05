@@ -10,10 +10,10 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/samber/lo"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
+
 	yandex "github.com/simple-container-com/sc-plugin-yandex/api"
 )
 
@@ -419,4 +419,75 @@ func TestServerlessContainer_DomainWithoutRegistrarIsAnError(t *testing.T) {
 	Expect(err).To(MatchError(ContainSubstring("no registrar serving it")))
 	Expect(mocks.countOf(tokenContainer)).To(Equal(0))
 	Expect(mocks.countOf(tokenDockerImage)).To(Equal(0))
+}
+
+// S2 regression — `PORT` and `REQUEST_PATH` are reserved on YC Serverless
+// Containers, and a revision that sets them is refused outright
+// (`Environment variable X is forbidden`). A client.yaml shared with an
+// AWS lambda MUST set PORT there, so SC drops the reserved names from
+// the forwarded env block before building the revision. See
+// forge/docs/design/2026-09-29/atrium-on-yandex-cloud/README.md §12.2.
+func TestServerlessContainer_DropsYCReservedEnvNames(t *testing.T) {
+	RegisterTestingT(t)
+
+	cfg := baseContainerInput()
+	cfg.StackConfig.Env = map[string]string{
+		"PORT":         "8080",
+		"REQUEST_PATH": "/ignored",
+		"LOG_LEVEL":    "debug",
+	}
+	mocks := newBucketMocks()
+	Expect(provisionContainer(cfg, mocks)).To(BeNil())
+
+	env := mocks.inputsOf(tokenContainer)["image"].ObjectValue()["environment"].ObjectValue()
+	for _, reserved := range []string{"PORT", "REQUEST_PATH"} {
+		_, present := env[resource.PropertyKey(reserved)]
+		Expect(present).To(BeFalse(), "reserved YC env name %q must not reach the revision", reserved)
+	}
+	Expect(env[resource.PropertyKey("LOG_LEVEL")].StringValue()).To(Equal("debug"))
+}
+
+// S1 regression — the postcondition on `RevisionId` turns a silent
+// no-revision deploy into a visible error. In reality the TF provider
+// wraps DeployRevision failures as `diag.Warning` and Pulumi records the
+// container as created, so `sc deploy` exits 0 and the YC edge answers
+// every path with `Container <id> does not have any revisions`. The
+// test simulates that by returning empty `revisionId` from the mock.
+func TestServerlessContainer_FailsWhenRevisionIsMissing(t *testing.T) {
+	RegisterTestingT(t)
+
+	// Override the default bucketMocks so the container comes back WITHOUT
+	// a revisionId while still carrying a non-empty id (otherwise the
+	// postcondition skips, see the ctx.DryRun() || id=="" guard).
+	mocks := newBucketMocks()
+	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
+		params, err := containerProvisionParams(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = ServerlessContainer(ctx, api.Stack{Name: "test-stack"}, containerResourceInput(baseContainerInput()), params)
+		return err
+	}, pulumi.WithMocks("project", "stack", &noRevisionMocks{bucketMocks: mocks}))
+
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("ends with no revision deployed"))
+	Expect(err.Error()).To(ContainSubstring(`folder="test-folder"`))
+	Expect(err.Error()).To(ContainSubstring("yc serverless container revision deploy"))
+}
+
+// noRevisionMocks wraps bucketMocks and strips revisionId from the
+// container's outputs, simulating the provider's downgrade-to-warning
+// behaviour on a failed DeployRevision.
+type noRevisionMocks struct{ *bucketMocks }
+
+func (m *noRevisionMocks) NewResource(args pulumi.MockResourceArgs) (string, resource.PropertyMap, error) {
+	id, outs, err := m.bucketMocks.NewResource(args)
+	if args.TypeToken == tokenContainer {
+		delete(outs, "revisionId")
+	}
+	return id, outs, err
+}
+
+func (m *noRevisionMocks) Call(args pulumi.MockCallArgs) (resource.PropertyMap, error) {
+	return m.bucketMocks.Call(args)
 }
