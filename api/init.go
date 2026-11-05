@@ -19,6 +19,7 @@ func init() {
 		TemplateTypeStaticWebsite:             ReadStaticWebsiteConfig,
 		ResourceTypeObjectStorageBucket:       ReadObjectStorageBucketConfig,
 		ResourceTypeWildcardCert:              ReadWildcardCertConfig,
+		ResourceTypeYandexContainerRegistry:   ReadContainerRegistryConfig,
 		RegistrarTypeYandexDns:                ReadRegistrarConfig,
 	})
 
@@ -54,6 +55,7 @@ func init() {
 			ResourceTypeWildcardCert,              // "yc-wildcard-cert"
 			TemplateTypeYandexServerlessContainer, // "yc-serverless-container"
 			TemplateTypeStaticWebsite,             // "yc-static-website"
+			ResourceTypeYandexContainerRegistry,   // "yc-container-registry"
 			StateStorageTypeYandexObjectStorage,   // "yc-object-storage" (state backend)
 			SecretsProviderTypeYandexKms,          // "yc-kms" (secrets provider)
 			SecretsTypeYandexLockbox,              // "yc-lockbox" (runtime secret store)

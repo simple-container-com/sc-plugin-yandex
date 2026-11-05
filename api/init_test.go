@@ -23,6 +23,7 @@ func TestProviderConfigsRegistered(t *testing.T) {
 		SecretsTypeYandexLockbox,
 		TemplateTypeYandexServerlessContainer,
 		ResourceTypeObjectStorageBucket,
+		ResourceTypeYandexContainerRegistry,
 		RegistrarTypeYandexDns,
 	} {
 		Expect(registered).To(HaveKey(typ), "provider config %q must be registered", typ)

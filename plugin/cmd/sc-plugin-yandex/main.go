@@ -108,6 +108,7 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 		ResourceTypes: []string{
 			ycApi.ResourceTypeObjectStorageBucket,
 			ycApi.ResourceTypeWildcardCert,
+			ycApi.ResourceTypeYandexContainerRegistry,
 			ycApi.TemplateTypeYandexServerlessContainer,
 			ycApi.TemplateTypeStaticWebsite,
 		},
@@ -332,6 +333,28 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
 		return p.provisionServerlessContainer(rctx.Pulumi, req)
+	case ycApi.ResourceTypeYandexContainerRegistry:
+		var reg ycApi.ContainerRegistry
+		if err := decodeInputsAs(req.GetInputs(), &reg); err != nil {
+			return nil, errors.Wrap(err, "decode container-registry config")
+		}
+		provider, err := p.buildProvider(rctx.Pulumi, &reg.AccountConfig, "container-registry", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+		if err != nil {
+			return nil, err
+		}
+		input := api.ResourceInput{
+			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &reg}},
+			StackParams: stackParams,
+		}
+		p.progress.Info("container-registry", fmt.Sprintf("provisioning container-registry %q", req.GetResourceName()))
+		out, err := ycInternal.ContainerRegistry(rctx.Pulumi, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		if err != nil {
+			p.progress.Error("container-registry", fmt.Sprintf("container-registry %q failed: %v", req.GetResourceName(), err))
+			return nil, err
+		}
+		urn := waitForComposite(out.Ref)
+		p.progress.Info("container-registry", fmt.Sprintf("container-registry %q ready (urn=%s)", req.GetResourceName(), urn))
+		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.ResourceTypeWildcardCert:
 		return p.provisionWildcardCert(ctx, rctx.Pulumi, req, stack, stackParams)
 	case ycApi.TemplateTypeStaticWebsite:
@@ -735,6 +758,8 @@ func waitForComposite(ref any) string {
 	switch r := ref.(type) {
 	case *ycInternal.ObjectStorageBucketOutput:
 		return waitForIDs(r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
+	case *ycInternal.ContainerRegistryOutput:
+		return waitForIDs(r.Registry.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
 	case *ycInternal.ServerlessContainerOutput:
 		// Container is always present. Secret + SecretVersion only exist when
 		// the config carried secrets. Triggers are a slice — iterate and append IDs.
