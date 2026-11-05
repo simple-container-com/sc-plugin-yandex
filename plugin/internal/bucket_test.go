@@ -12,10 +12,10 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
+
 	yandex "github.com/simple-container-com/sc-plugin-yandex/api"
 )
 
@@ -33,7 +33,19 @@ func (m *bucketMocks) NewResource(args pulumi.MockResourceArgs) (string, resourc
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.created = append(m.created, args)
-	return args.Name + "-id", args.Inputs, nil
+	outputs := args.Inputs
+	// Serverless containers get a synthetic revisionId so the deploy-fidelity
+	// postcondition (ServerlessContainer: assert RevisionId != "") passes in
+	// tests. The provider populates this field at deploy time; the mock does
+	// not round-trip through the provider so without this the container would
+	// always look like a failed revision deploy under tests.
+	if args.TypeToken == "yandex:index/serverlessContainer:ServerlessContainer" {
+		if outputs == nil {
+			outputs = resource.PropertyMap{}
+		}
+		outputs["revisionId"] = resource.NewStringProperty(args.Name + "-revision")
+	}
+	return args.Name + "-id", outputs, nil
 }
 
 func (m *bucketMocks) Call(args pulumi.MockCallArgs) (resource.PropertyMap, error) {

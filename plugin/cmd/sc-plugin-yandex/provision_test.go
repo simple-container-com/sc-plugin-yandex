@@ -49,6 +49,10 @@ func (m *engineMocks) NewResource(args sdk.MockResourceArgs) (string, resource.P
 	case "yandex:index/serverlessContainer:ServerlessContainer":
 		if !m.preview {
 			outs["url"] = resource.NewProperty("https://bba1.containers.yandexcloud.net/")
+			// Non-empty revisionId → deploy-fidelity postcondition
+			// (ServerlessContainer: assert RevisionId != "") passes. A
+			// failing-deploy test case can override this by setting it to "".
+			outs["revisionId"] = resource.NewProperty(args.Name + "-rev1")
 		}
 	case "docker:index/image:Image":
 		if !m.preview {

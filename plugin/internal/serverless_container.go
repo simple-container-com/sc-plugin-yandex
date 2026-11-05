@@ -12,14 +12,13 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/samber/lo"
-
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
+	"github.com/samber/lo"
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
-	yandex "github.com/simple-container-com/sc-plugin-yandex/api"
 	sdkYandex "github.com/simple-container-com/pulumi-yandex/sdk/go/yandex"
+
+	yandex "github.com/simple-container-com/sc-plugin-yandex/api"
 )
 
 const (
@@ -48,6 +47,27 @@ const (
 var DefaultContainerRoles = []string{
 	"container-registry.images.puller",
 	"lockbox.payloadViewer",
+}
+
+// ycReservedEnvNames are env-variable names the Serverless Containers runtime
+// OWNS. A revision that sets any of them is refused with
+// `InvalidArgument: Environment variable X is forbidden`. SC drops them from
+// the forwarded env block before building the revision so a client.yaml
+// shared with an AWS lambda stack (where e.g. PORT is correct) deploys to
+// YC unchanged — a YAML merge key cannot delete an inherited key, and
+// anything that forces hand-duplicated env blocks silently drifts.
+//
+// Keep this list tight: a name added here is removed from every YC
+// serverless-container deploy unconditionally, so adding one that is NOT
+// actually reserved masks real operator intent. Live-caught refusal
+// catalogue so far: PORT (2026-09-30, forge-atrium staging-ru, refusal 1
+// of two in run 36687152934). Design doc 2026-09-29 §12.2 names
+// REQUEST_PATH as the only other runtime-defined name; listing it here
+// defensively because the YC runtime populating a name the operator
+// asked to set is exactly the same silent 404 failure mode as PORT.
+var ycReservedEnvNames = map[string]struct{}{
+	"PORT":         {},
+	"REQUEST_PATH": {},
 }
 
 // ycResourceNameRegexp is YC's name rule for folder-scoped resources. It is
@@ -216,6 +236,24 @@ func ServerlessContainer(ctx *sdk.Context, stack api.Stack, input api.ResourceIn
 	for name := range secretValues {
 		delete(envVariables, name)
 	}
+	// Drop every YC-runtime-owned env name — the revision deploy rejects them
+	// outright (see ycReservedEnvNames). Log one line per dropped name so an
+	// operator looking at the deploy log can see what SC removed vs. what the
+	// client.yaml asked for. Deterministic order keeps the log stable against
+	// map-iteration ordering across deploys.
+	droppedNames := make([]string, 0, len(ycReservedEnvNames))
+	for name := range ycReservedEnvNames {
+		if _, present := envVariables[name]; present {
+			droppedNames = append(droppedNames, name)
+		}
+	}
+	sort.Strings(droppedNames)
+	for _, name := range droppedNames {
+		delete(envVariables, name)
+		params.Log.Info(ctx.Context(),
+			"dropping YC-reserved env name %q from container %q — YC runtime defines it; set it on client.yaml for the matching AWS stack instead",
+			name, containerName)
+	}
 
 	containerArgs := &sdkYandex.ServerlessContainerArgs{
 		Name:             sdk.String(containerName),
@@ -250,6 +288,48 @@ func ServerlessContainer(ctx *sdk.Context, stack api.Stack, input api.ResourceIn
 	}
 	ctx.Export(fmt.Sprintf("%s-%s-container-id", stack.Name, deployParams.Environment), container.ID())
 	ctx.Export(fmt.Sprintf("%s-%s-container-url", stack.Name, deployParams.Environment), container.Url)
+
+	// Postcondition: assert the container ends with a revision deployed.
+	//
+	// terraform-provider-yandex wraps DeployRevision failures as `diag.Warning`
+	// rather than `diag.Error` (see resource_yandex_serverless_container.go in
+	// v0.229.0+ — `resourceYandexServerlessContainerDiagsFromDeployRevisionError`),
+	// so Pulumi records the container as successfully created with no revision
+	// attached and `sc deploy` exits 0. The YC edge then answers every path
+	// with `Container <id> does not have any revisions`. Live-caught on
+	// forge-atrium staging-ru 2026-09-30 (two refusals in a row, each invisible
+	// behind a green check: reserved PORT and Bad path in image).
+	//
+	// SC cannot turn a provider warning into an error from outside, but the
+	// container's own RevisionId output IS the from-inside signal: empty when
+	// no revision deployed. Fail the deploy here with the container id + folder
+	// so the operator sees exactly what to replay.
+	containerIDOutput := container.ID()
+	containerAssert := sdk.All(containerIDOutput, container.RevisionId).ApplyT(func(all []any) (string, error) {
+		id, _ := all[0].(sdk.ID)
+		revisionID, _ := all[1].(string)
+		// Skip the postcondition during preview. In a real preview against
+		// the engine `container.RevisionId` is Unknown and ApplyT never
+		// fires, but the test mocks return empty strings for unknown
+		// outputs — which would trip this check and make `sc preview` fail
+		// on a stack that has not deployed yet. Detect preview either by
+		// `ctx.DryRun()` (authoritative) or by an empty resource id (the
+		// test-mock signal for a not-yet-created resource).
+		if ctx.DryRun() || strings.TrimSpace(string(id)) == "" {
+			return revisionID, nil
+		}
+		if strings.TrimSpace(revisionID) == "" {
+			return "", errors.Errorf(
+				"YC serverless container %q (id=%q, folder=%q) ends with no revision deployed — "+
+					"provider downgraded DeployRevision failure to a warning, see the YC log for the refusal; "+
+					"replay with `yc serverless container revision deploy --container-id %s --folder-id %s …`",
+				containerName, id, crInput.FolderID, id, crInput.FolderID,
+			)
+		}
+		return revisionID, nil
+	})
+	ctx.Export(fmt.Sprintf("%s-%s-container-revision-id", stack.Name, deployParams.Environment), containerAssert)
+
 	opts = append(opts, sdk.DependsOn([]sdk.Resource{container}))
 
 	// Without this the container's endpoint answers 403 to everyone, including the
