@@ -634,8 +634,18 @@ func (p *ycPlugin) ConvertStackConfig(_ context.Context, req *scpluginv1.Convert
 		if err := yamlRoundTrip(templatePlain, tplCfg); err != nil {
 			return nil, errors.Wrapf(err, "decode template_config for %q", templateType)
 		}
+		// StackConfigStatic.Site is a NAMED field tagged
+		// `json:",inline" yaml:",inline"`. SC-core's sender
+		// json.Marshal doesn't honour the inline option and emits
+		// `"Site":{...}` nested; yaml.v3's inline decoder on this
+		// side would then leave Site zero. Use the JSON roundtrip
+		// helper that matches the sender's encoding — it decodes
+		// Site into the Go field correctly, so ToStaticWebsiteConfig
+		// below reads a populated Domain/BaseDnsZone/IndexDocument
+		// from stackCfg.Site.* and fills the top-level mirrors the
+		// Provision path reads.
 		stackCfg := &api.StackConfigStatic{}
-		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+		if err := jsonRoundTrip(stackPlain, stackCfg); err != nil {
 			return nil, errors.Wrap(err, "decode StackConfigStatic")
 		}
 		typedInput, cerr = ycApi.ToStaticWebsiteConfig(tplCfg, stackDir, stackName, stackCfg)
@@ -677,6 +687,30 @@ func yamlRoundTrip(src any, out any) error {
 		return err
 	}
 	return yaml.Unmarshal(b, out)
+}
+
+// jsonRoundTrip decodes a plain map[string]any into a typed struct via
+// a JSON round-trip — symmetric with the SC-core sender
+// (`PlainToInputs` calls `json.Marshal`). Use this for structs whose
+// nested embeds use `json:",inline"` on NAMED fields. yaml.v3 flattens
+// on `,inline`; `encoding/json` ignores it and emits the Go field name
+// as a nested object key. A yaml-roundtrip on the receiver side can
+// then NOT flatten the nested block (its decoder expects flat), so the
+// named field stays zero. json-roundtrip honours the Go field name on
+// both ends and decodes the nested object correctly.
+//
+// Live-caught 2026-11-09 on landing's forge-landing-ru-apex--staging
+// deploy (run 42603017630): yc-static-website received an empty
+// stackCfg.Site.Domain because `StackConfigStatic.Site` is tagged
+// `json:",inline" yaml:",inline"`. Fourth exposure of the plugin-bus
+// inline-tag asymmetry — see roadmap item
+// plugin-bus-json-yaml-inline-tag-asymmetry.
+func jsonRoundTrip(src any, out any) error {
+	b, err := json.Marshal(src)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
 }
 
 // InitStateStore — pre-engine. The sidecar on SC core calls this and
