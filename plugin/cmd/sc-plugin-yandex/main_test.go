@@ -212,18 +212,25 @@ func TestConvertStackConfig_EveryTemplateDecodesSpecificType(t *testing.T) {
 				"redirectHttpToHttps": true,
 			},
 			stackConfig: map[string]any{
-				// StackConfigStatic.Site is `json:",inline" yaml:",inline"` —
-				// encoding/json ignores the tag and yaml.v3 flattens on decode,
-				// so server.yaml authors + bus-side marshal both put Site's
-				// fields at the TOP level, not nested under "Site" (the same
-				// asymmetry trap the plugin-bus has repeatedly hit — yandex
-				// TRAPS.md trap 6, sc-plugin-gcp #3 fix).
-				"bundleDir":     "./bundle",
-				"location":      "ru-central1",
-				"domain":        "site.simple-container.com",
-				"baseDnsZone":   "simple-container.com",
-				"indexDocument": "index.html",
-				"errorDocument": "404.html",
+				// StackConfigStatic.Site is `json:",inline" yaml:",inline"`
+				// but SC-core's sender (PlainToInputs → json.Marshal)
+				// emits it NESTED as `"Site":{...}` because encoding/json
+				// doesn't honour `,inline` on NAMED fields. Earlier
+				// revisions of this test put Site's fields FLAT at the
+				// top (what yaml.v3's inline decoder expects) — which
+				// passed against the yaml-roundtrip but did not model
+				// the real wire. Live caught on landing-ru-apex run
+				// 42603017630 as "yc-static-website is missing a
+				// domain". The nested shape forces the ConvertStack
+				// Config decode onto the `jsonRoundTrip` path.
+				"bundleDir": "./bundle",
+				"location":  "ru-central1",
+				"Site": map[string]any{
+					"domain":        "site.simple-container.com",
+					"baseDnsZone":   "simple-container.com",
+					"indexDocument": "index.html",
+					"errorDocument": "404.html",
+				},
 			},
 		},
 	}
