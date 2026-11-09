@@ -157,3 +157,93 @@ func TestProvisionCollectorFromRequest_OlderCoreSendsNothing(t *testing.T) {
 	Expect(cc.SecretEnvVariables()).To(BeEmpty())
 	Expect(cc.Dependencies()).To(BeEmpty())
 }
+
+// Every template type this plugin advertises on its Schema must decode
+// the template_config into the concrete Go type its ToXxxConfig
+// converter asserts on. The handler used to hoist the decode above the
+// switch and land every arm with `*TemplateConfig`; `yc-static-website`
+// failed with `template config is not of type
+// *yandex.StaticWebsiteTemplateConfig: *yandex.TemplateConfig` on every
+// landing-ru-apex deploy (2026-11-09), and `yc-serverless-container`
+// worked by accident because its converter happens to accept the
+// generic. This table test pins the right concrete type gets to each
+// converter — add a case here when a new template type lands.
+func TestConvertStackConfig_EveryTemplateDecodesSpecificType(t *testing.T) {
+	RegisterTestingT(t)
+
+	acct := map[string]any{
+		"cloudId":           "b1g-cloud",
+		"folderId":          "b1g-folder",
+		"serviceAccountKey": `{"id":"k"}`,
+	}
+
+	cases := []struct {
+		name         string
+		templateType string
+		// templateConfig values that WOULD be dropped on silent fall-
+		// through to the generic *TemplateConfig — a positive signal
+		// the specific type was used.
+		templateConfig map[string]any
+		stackConfig    map[string]any
+	}{
+		{
+			name:         "yc-serverless-container → TemplateConfig",
+			templateType: ycApi.TemplateTypeYandexServerlessContainer,
+			// AccountConfig fields are shared, so a minimal case is enough
+			// here; the discriminating case is yc-static-website below.
+			templateConfig: acct,
+			stackConfig: map[string]any{
+				"image": map[string]any{"name": "cr.yandex/crp/app:v1"},
+			},
+		},
+		{
+			name:         "yc-static-website → StaticWebsiteTemplateConfig",
+			templateType: ycApi.TemplateTypeStaticWebsite,
+			// edgeCacheSettings + gzipOn + redirectHttpToHttps only exist
+			// on StaticWebsiteTemplateConfig. If the handler decodes into
+			// the generic TemplateConfig, they're silently dropped and
+			// ToStaticWebsiteConfig's type assertion fails.
+			templateConfig: map[string]any{
+				"cloudId":             "b1g-cloud",
+				"folderId":            "b1g-folder",
+				"serviceAccountKey":   `{"id":"k"}`,
+				"edgeCacheSettings":   7200,
+				"gzipOn":              true,
+				"redirectHttpToHttps": true,
+			},
+			stackConfig: map[string]any{
+				// StackConfigStatic.Site is `json:",inline" yaml:",inline"` —
+				// encoding/json ignores the tag and yaml.v3 flattens on decode,
+				// so server.yaml authors + bus-side marshal both put Site's
+				// fields at the TOP level, not nested under "Site" (the same
+				// asymmetry trap the plugin-bus has repeatedly hit — yandex
+				// TRAPS.md trap 6, sc-plugin-gcp #3 fix).
+				"bundleDir":     "./bundle",
+				"location":      "ru-central1",
+				"domain":        "site.simple-container.com",
+				"baseDnsZone":   "simple-container.com",
+				"indexDocument": "index.html",
+				"errorDocument": "404.html",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			RegisterTestingT(t)
+			p := newTestPlugin()
+			req := &scpluginv1.ConvertStackConfigRequest{
+				Header:         &scpluginv1.RequestHeader{StackName: "test", Environment: "staging-ru"},
+				TemplateType:   tc.templateType,
+				StackName:      "test",
+				StackDir:       "/tmp",
+				TemplateConfig: toInputs(t, tc.templateConfig),
+				StackConfig:    toInputs(t, tc.stackConfig),
+			}
+			resp, err := p.ConvertStackConfig(nil, req)
+			Expect(err).ToNot(HaveOccurred(), "ConvertStackConfig for %q must not fail on type-assert", tc.templateType)
+			Expect(resp).ToNot(BeNil())
+			Expect(resp.Input).ToNot(BeEmpty(), "response Input must carry the typed converter's output")
+		})
+	}
+}

@@ -605,22 +605,35 @@ func (p *ycPlugin) ConvertStackConfig(_ context.Context, req *scpluginv1.Convert
 	stackDir := req.GetStackDir()
 	p.progress.Info("convert-stack-config", fmt.Sprintf("template=%q stack=%q", templateType, stackName))
 
-	tplCfg := &ycApi.TemplateConfig{}
-	if err := yamlRoundTrip(scPlugin.InputsToPlain(req.GetTemplateConfig()), tplCfg); err != nil {
-		return nil, errors.Wrapf(err, "decode template_config for %q", templateType)
-	}
-
+	// Decode template_config into the type each `ToXxxConfig` converter
+	// ACTUALLY type-asserts on. Historically this was hoisted above the
+	// switch as a single `&ycApi.TemplateConfig{}` decode and the arms
+	// relied on `yc-serverless-container`'s converter happening to accept
+	// the generic type — `yc-static-website` doesn't, and silently fell
+	// into "template config is not of type *yandex.StaticWebsiteTemplateConfig:
+	// *yandex.TemplateConfig" on every landing-ru-apex deploy (2026-11-09).
+	// Decode inside each arm matches init.go's ConfigRegisterMap wiring:
+	// one registered reader per template type, concrete Go type matches.
+	templatePlain := scPlugin.InputsToPlain(req.GetTemplateConfig())
 	stackPlain := scPlugin.InputsToPlain(req.GetStackConfig())
 	var typedInput any
 	var cerr error
 	switch templateType {
 	case ycApi.TemplateTypeYandexServerlessContainer:
+		tplCfg := &ycApi.TemplateConfig{}
+		if err := yamlRoundTrip(templatePlain, tplCfg); err != nil {
+			return nil, errors.Wrapf(err, "decode template_config for %q", templateType)
+		}
 		stackCfg := &api.StackConfigSingleImage{}
 		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
 			return nil, errors.Wrap(err, "decode StackConfigSingleImage")
 		}
 		typedInput, cerr = ycApi.ToServerlessContainerConfig(tplCfg, stackCfg)
 	case ycApi.TemplateTypeStaticWebsite:
+		tplCfg := &ycApi.StaticWebsiteTemplateConfig{}
+		if err := yamlRoundTrip(templatePlain, tplCfg); err != nil {
+			return nil, errors.Wrapf(err, "decode template_config for %q", templateType)
+		}
 		stackCfg := &api.StackConfigStatic{}
 		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
 			return nil, errors.Wrap(err, "decode StackConfigStatic")
