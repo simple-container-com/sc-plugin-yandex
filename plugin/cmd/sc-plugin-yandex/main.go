@@ -31,6 +31,7 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/internals"
 	"github.com/samber/lo"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
@@ -126,7 +127,7 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 
 // pulumiContextFromHeader opens the handler's Pulumi context via the shared
 // api/pkg/plugin/runtime library (yandex's own pre-split helpers moved there
-// unchanged: pulumi_wait.go via go:linkname, engine.go for the local Engine
+// unchanged: wait.go via go:linkname, engine.go for the local Engine
 // fallback). Handlers call runtime.Settle on the returned Context before
 // responding to drain pending registrations.
 //
@@ -192,7 +193,11 @@ func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecor
 		p.progress.Error("dns-record", fmt.Sprintf("record %q failed: %v", req.GetRecordName(), err))
 		return nil, err
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(ctx, out.Ref)
+	if err != nil {
+		p.progress.Error("dns-record", fmt.Sprintf("record %q failed: %v", req.GetRecordName(), err))
+		return nil, err
+	}
 	p.progress.Info("dns-record", fmt.Sprintf("record %q registered (urn=%s)", req.GetRecordName(), urn))
 	return &scpluginv1.NewDnsRecordResponse{Urn: urn}, nil
 }
@@ -225,7 +230,11 @@ func (p *ycPlugin) NewOverrideHeaderRule(ctx context.Context, req *scpluginv1.Ne
 		p.progress.Error("worker-route", fmt.Sprintf("rule %q failed: %v", rule.Name, err))
 		return nil, err
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(ctx, out.Ref)
+	if err != nil {
+		p.progress.Error("worker-route", fmt.Sprintf("rule %q failed: %v", rule.Name, err))
+		return nil, err
+	}
 	p.progress.Info("worker-route", fmt.Sprintf("rule %q registered (urn=%s)", rule.Name, urn))
 	return &scpluginv1.NewOverrideHeaderRuleResponse{Urn: urn}, nil
 }
@@ -252,7 +261,11 @@ func (p *ycPlugin) ProvisionDomainForEndpoint(ctx context.Context, req *scplugin
 		p.progress.Error("endpoint", fmt.Sprintf("endpoint %q failed: %v", endpoint.Name, err))
 		return nil, err
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(ctx, out.Ref)
+	if err != nil {
+		p.progress.Error("endpoint", fmt.Sprintf("endpoint %q failed: %v", endpoint.Name, err))
+		return nil, err
+	}
 	p.progress.Info("endpoint", fmt.Sprintf("endpoint %q bound (urn=%s)", endpoint.Name, urn))
 	return &scpluginv1.ProvisionDomainForEndpointResponse{Urn: urn}, nil
 }
@@ -285,7 +298,11 @@ func (p *ycPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest
 		p.progress.Error("provider", fmt.Sprintf("provider init failed: %v", err))
 		return nil, errors.Wrap(err, "init yandex provider")
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(ctx, out.Ref)
+	if err != nil {
+		p.progress.Error("provider", fmt.Sprintf("provider %q failed: %v", req.GetProviderResourceName(), err))
+		return nil, err
+	}
 	p.progress.Info("provider", fmt.Sprintf("provider %q ready (urn=%s)", req.GetProviderResourceName(), urn))
 	return &scpluginv1.ProviderResponse{ProviderUrn: urn}, nil
 }
@@ -328,11 +345,15 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			p.progress.Error("bucket", fmt.Sprintf("bucket %q failed: %v", req.GetResourceName(), err))
 			return nil, err
 		}
-		urn := waitForComposite(out.Ref)
+		urn, awaitErr := awaitComposite(ctx, out.Ref)
+		if awaitErr != nil {
+			p.progress.Error("bucket", fmt.Sprintf("bucket %q failed: %v", req.GetResourceName(), awaitErr))
+			return nil, awaitErr
+		}
 		p.progress.Info("bucket", fmt.Sprintf("bucket %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeYandexServerlessContainer:
-		return p.provisionServerlessContainer(rctx.Pulumi, req)
+		return p.provisionServerlessContainer(ctx, rctx.Pulumi, req)
 	case ycApi.ResourceTypeYandexContainerRegistry:
 		var reg ycApi.ContainerRegistry
 		if err := decodeInputsAs(req.GetInputs(), &reg); err != nil {
@@ -352,7 +373,11 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			p.progress.Error("container-registry", fmt.Sprintf("container-registry %q failed: %v", req.GetResourceName(), err))
 			return nil, err
 		}
-		urn := waitForComposite(out.Ref)
+		urn, awaitErr := awaitComposite(ctx, out.Ref)
+		if awaitErr != nil {
+			p.progress.Error("container-registry", fmt.Sprintf("container-registry %q failed: %v", req.GetResourceName(), awaitErr))
+			return nil, awaitErr
+		}
 		p.progress.Info("container-registry", fmt.Sprintf("container-registry %q ready (urn=%s)", req.GetResourceName(), urn))
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.ResourceTypeWildcardCert:
@@ -387,7 +412,11 @@ func (p *ycPlugin) provisionWildcardCert(stdctx context.Context, pctx *sdk.Conte
 		p.progress.Error("wildcard-cert", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
 		return nil, err
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(stdctx, out.Ref)
+	if err != nil {
+		p.progress.Error("wildcard-cert", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
 	outputs, err := runtime.HarvestExports(stdctx, pctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "harvest yc-wildcard-cert exports")
@@ -430,7 +459,11 @@ func (p *ycPlugin) provisionStaticWebsite(stdctx context.Context, pctx *sdk.Cont
 		p.progress.Error("static-website", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
 		return nil, err
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(stdctx, out.Ref)
+	if err != nil {
+		p.progress.Error("static-website", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
 	outputs, err := runtime.HarvestExports(stdctx, pctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "harvest yc-static-website exports")
@@ -442,7 +475,13 @@ func (p *ycPlugin) provisionStaticWebsite(stdctx context.Context, pctx *sdk.Cont
 // provisionServerlessContainer is the yc-serverless-container branch of
 // Provision, split out so a test can drive it against Pulumi mocks with the
 // exact request SC core puts on the bus.
-func (p *ycPlugin) provisionServerlessContainer(pctx *sdk.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
+//
+// stdctx is the handler's own RPC context, threaded in so the output awaits
+// below can surface a refused registration instead of parking on it. This
+// handler was the one surface the port to api/pkg/plugin/runtime left behind
+// (the ported ones — wildcard-cert, static-website — already took it), and
+// that omission is what made the hang customer-visible here first.
+func (p *ycPlugin) provisionServerlessContainer(stdctx context.Context, pctx *sdk.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
 	stack := api.Stack{Name: req.GetHeader().GetStackName()}
 	stackParams := &api.StackParams{StackName: req.GetHeader().GetStackName(), Environment: req.GetHeader().GetEnvironment()}
 	// The deploy input is SC core's converted ServerlessContainerInput (the
@@ -481,14 +520,30 @@ func (p *ycPlugin) provisionServerlessContainer(pctx *sdk.Context, req *scplugin
 		p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
 		return nil, err
 	}
-	urn := waitForComposite(out.Ref)
+	urn, err := awaitComposite(stdctx, out.Ref)
+	if err != nil {
+		// This is the line the whole fix exists for. Before it, a refused
+		// container registration left the handler parked inside the await
+		// and the operator saw nothing at all; now the provider's refusal
+		// reaches the deploy log and fails the RPC.
+		p.progress.Error("serverless-container", fmt.Sprintf("container %q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
 	p.progress.Info("serverless-container", fmt.Sprintf("container %q ready (urn=%s)", req.GetResourceName(), urn))
 	// The ctx.Export of the container URL lands on this plugin's own Context, which
 	// never registers stack outputs — so without this line the deploy log names no
 	// URL at all, and a stack without `domain:` (served on its
 	// *.containers.yandexcloud.net endpoint) has no way to find where it lives.
+	//
+	// Cosmetic, so a failure here is a warning rather than a failed deploy: the
+	// container is already provisioned by this point, and the id above is the
+	// handle SC core actually records.
 	if sc, ok := out.Ref.(*ycInternal.ServerlessContainerOutput); ok && sc.Container != nil {
-		if u := waitForRef(sc.Container.Url); u != "" {
+		u, urlErr := awaitRef(stdctx, sc.Container.Url)
+		switch {
+		case urlErr != nil:
+			p.progress.Warn("serverless-container", fmt.Sprintf("container %q provisioned, but resolving its URL failed: %v", req.GetResourceName(), urlErr))
+		case u != "":
 			p.progress.Info("serverless-container", fmt.Sprintf("container %q is served at %s", req.GetResourceName(), u))
 		}
 	}
@@ -585,7 +640,12 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 	if err != nil {
 		return nil, err
 	}
-	resp.Urn = waitForComposite(out.Ref)
+	urn, err := awaitComposite(ctx, out.Ref)
+	if err != nil {
+		p.progress.Error("compute-process", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
+	resp.Urn = urn
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
 }
@@ -791,22 +851,43 @@ func strVal(v *scpluginv1.InputValue) string {
 	return v.GetStringValue()
 }
 
-// waitForComposite blocks until the IDs of every known composite output
-// field resolve. Needed for ObjectStorageBucket (4 sub-resources),
-// ServerlessContainer (container + revision + SA), and any other lifted
+// awaitComposite resolves the IDs of every known composite output field.
+// Needed for ObjectStorageBucket (4 sub-resources), ServerlessContainer
+// (container + SA + registry + lockbox + triggers), and any other lifted
 // surface that returns a struct of pulumi resources rather than a single
 // IDOutput. Returns the first resource's URN for logging; the plugin's
 // return value is coarse-grained since the SC-core-side consumer treats
 // Ref as a bag.
-func waitForComposite(ref any) string {
+//
+// It takes a context and returns an error, and BOTH are load-bearing. The
+// predecessor (waitForIDs) did neither: it resolved each id with an ApplyT
+// closure and blocked on an unbuffered `<-done` until every closure had
+// fired. But Pulumi does NOT run an Apply callback on a *rejected* Output —
+// the error propagates to the derived output instead — so when Yandex
+// refused a registration the callback never fired, `done` never closed, and
+// the handler parked forever holding the provider's error where nobody read
+// it. Symptom, as reported by a customer on a yc-serverless-container deploy
+// 2026-11-09: `sc deploy` builds a plan, hangs at Provision, creates no
+// resource, and the only error ever printed is the `context canceled` of the
+// operator's own Ctrl-C. A 90-minute agent turn died inside it with no
+// diagnostic.
+//
+// internals.UnsafeAwaitOutput is the primitive runtime.HarvestExports
+// already uses fleet-wide: it returns the output's rejection error, which is
+// the half that fixes the hang. Its ctx handling is partial — awaitOnce
+// checks ctx.Err() before parking, but then parks in a sync.Cond that
+// cancellation alone cannot wake — so do not read the ctx parameter as a
+// hard cancellation guarantee. A rejection does wake it, because fulfill()
+// broadcasts.
+func awaitComposite(ctx context.Context, ref any) (string, error) {
 	if ref == nil {
-		return ""
+		return "", nil
 	}
 	switch r := ref.(type) {
 	case *ycInternal.ObjectStorageBucketOutput:
-		return waitForIDs(r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
+		return awaitIDs(ctx, r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
 	case *ycInternal.ContainerRegistryOutput:
-		return waitForIDs(r.Registry.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
+		return awaitIDs(ctx, r.Registry.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
 	case *ycInternal.ServerlessContainerOutput:
 		// Container is always present. Secret + SecretVersion only exist when
 		// the config carried secrets. Triggers are a slice — iterate and append IDs.
@@ -831,86 +912,83 @@ func waitForComposite(ref any) string {
 				ids = append(ids, t.ID())
 			}
 		}
-		return waitForIDs(ids...)
+		return awaitIDs(ctx, ids...)
 	default:
-		return waitForRef(ref)
+		return awaitRef(ctx, ref)
 	}
 }
 
-// waitForIDs blocks until every passed IDOutput resolves. Each ApplyT
-// closure signals once; the aggregator closes the done channel when the
-// last signal arrives. Returns the first ID as the headline URN.
-func waitForIDs(ids ...sdk.IDOutput) string {
+// awaitIDs resolves every passed IDOutput, returning the first as the
+// headline URN. A rejected id fails the whole await, naming its position so
+// the deploy log says which of a composite's sub-resources the provider
+// refused.
+//
+// Resolving sequentially is deliberate: each Output resolves on its own
+// Pulumi goroutine regardless of the order we read them, so awaiting in
+// series costs the same wall-clock as the slowest one and buys per-id error
+// attribution.
+func awaitIDs(ctx context.Context, ids ...sdk.IDOutput) (string, error) {
 	if len(ids) == 0 {
-		return ""
+		return "", nil
 	}
-	remaining := len(ids)
-	done := make(chan struct{})
-	var mu sync.Mutex
 	var first string
 	for i, id := range ids {
-		i, id := i, id
-		id.ApplyT(func(idv sdk.ID) sdk.ID {
-			mu.Lock()
-			if i == 0 {
-				first = string(idv)
-			}
-			remaining--
-			if remaining == 0 {
-				close(done)
-			}
-			mu.Unlock()
-			return idv
-		})
+		idv, err := awaitOutputString(ctx, id)
+		if err != nil {
+			return "", errors.Wrapf(err, "await resource id %d of %d", i+1, len(ids))
+		}
+		if i == 0 {
+			first = idv
+		}
 	}
-	<-done
-	return first
+	return first, nil
 }
 
-// waitForRef blocks until a Pulumi Output in a resource ref resolves. See the
-// sister function in sc-plugin-cloudflare for why: Pulumi's SDK fires
-// RegisterResource inside an async goroutine, so returning before the output
-// resolves and letting pctx.Close() run tears down the engine connection
-// mid-registration — the request vanishes silently.
-func waitForRef(ref any) string {
+// awaitRef resolves a single Pulumi Output in a resource ref. See the sister
+// function in sc-plugin-cloudflare for why a handler must not return before
+// its outputs resolve: Pulumi's SDK fires RegisterResource inside an async
+// goroutine, so returning early and letting pctx.Close() run tears down the
+// engine connection mid-registration and the request vanishes silently.
+func awaitRef(ctx context.Context, ref any) (string, error) {
 	if ref == nil {
-		return ""
+		return "", nil
 	}
 	switch r := ref.(type) {
 	case string:
-		return r
+		return r, nil
 	case sdk.IDOutput:
-		ch := make(chan string, 1)
-		r.ApplyT(func(id sdk.ID) sdk.ID {
-			select {
-			case ch <- string(id):
-			default:
-			}
-			return id
-		})
-		return <-ch
+		return awaitOutputString(ctx, r)
 	case sdk.URNOutput:
-		ch := make(chan string, 1)
-		r.ApplyT(func(u sdk.URN) sdk.URN {
-			select {
-			case ch <- string(u):
-			default:
-			}
-			return u
-		})
-		return <-ch
+		return awaitOutputString(ctx, r)
 	case sdk.StringOutput:
-		ch := make(chan string, 1)
-		r.ApplyT(func(s string) string {
-			select {
-			case ch <- s:
-			default:
-			}
-			return s
-		})
-		return <-ch
+		return awaitOutputString(ctx, r)
 	default:
-		return fmt.Sprintf("%v", r)
+		return fmt.Sprintf("%v", r), nil
+	}
+}
+
+// awaitOutputString resolves any Output to its string form. An *unknown*
+// value is not an error and resolves to "": that is how a preview reports a
+// resource that does not exist yet, and failing there would make
+// `sc preview` unusable against a stack that has never deployed — the same
+// trap the S1 revision postcondition has to dodge via ctx.DryRun().
+func awaitOutputString(ctx context.Context, out sdk.Output) (string, error) {
+	res, err := internals.UnsafeAwaitOutput(ctx, out)
+	if err != nil {
+		return "", err
+	}
+	if !res.Known || res.Value == nil {
+		return "", nil
+	}
+	switch v := res.Value.(type) {
+	case sdk.ID:
+		return string(v), nil
+	case sdk.URN:
+		return string(v), nil
+	case string:
+		return v, nil
+	default:
+		return fmt.Sprintf("%v", v), nil
 	}
 }
 

@@ -25,7 +25,7 @@ import (
 // `pulumi preview` on a first deploy: no resource exists yet, so none has an id
 // or any computed output. The plugin's own context is never a dry-run one (the
 // RequestHeader carries no such flag), so the context in these tests is not
-// either — the empty ids reach waitForComposite as known values, as they do live.
+// either — the empty ids reach awaitComposite as known values, as they do live.
 type engineMocks struct {
 	mu      sync.Mutex
 	preview bool
@@ -177,7 +177,7 @@ func runProvision(p *ycPlugin, regs []*scpluginv1.ProvisionRegistrarRequest, req
 		}
 	}
 	runErr := sdk.RunErr(func(pctx *sdk.Context) error {
-		resp, err = p.provisionServerlessContainer(pctx, req)
+		resp, err = p.provisionServerlessContainer(context.Background(), pctx, req)
 		return nil
 	}, opts)
 	if err == nil {
@@ -366,4 +366,53 @@ func TestProvision_FailedPendingRegistrationFailsTheRPC(t *testing.T) {
 	resp, err := p.Provision(context.Background(), twoPeaksRequest(t, nil, nil))
 	Expect(err).To(MatchError(ContainSubstring("cannot set access bindings")))
 	Expect(resp).To(BeNil())
+}
+
+const tokenServerlessContainer = "yandex:index/serverlessContainer:ServerlessContainer"
+
+// The one that cost a customer a week. When the engine refuses the container
+// itself, its IDOutput is *rejected*, not resolved — and Pulumi does not run an
+// Apply callback on a rejected Output. The old wait was an ApplyT whose
+// callback closed a channel the handler then received from unconditionally, so
+// a refusal meant the callback never fired, the receive never returned, and
+// Provision parked forever holding the provider's error where nobody could read
+// it. Live symptom (org boris290796-tech, 2026-11-09): `sc deploy` builds a
+// plan, prints Provision("yc-serverless-container"), creates no resource, and
+// says nothing until the operator cancels — then only `context canceled`.
+//
+// So this asserts both halves: the handler RETURNS (the deadlock), and it
+// returns the provider's own message (the swallowed diagnostic). The timeout is
+// what makes a regression fail instead of hanging the suite.
+func TestProvision_RefusedContainerFailsFastWithTheProviderError(t *testing.T) {
+	RegisterTestingT(t)
+	p := newTestPlugin()
+	opts := sdk.WithMocks("two-peaks", "staging-ru", &engineMocks{})
+	for _, reg := range forgeInfraRegistrars() {
+		Expect(sdk.RunErr(func(pctx *sdk.Context) error {
+			_, err := p.provisionRegistrar(pctx, reg)
+			return err
+		}, opts)).To(Succeed())
+	}
+	mocks := &failingMocks{refuse: tokenServerlessContainer}
+	p.newPulumiContext = func(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, error) {
+		return sdk.NewContext(ctx, sdk.RunInfo{Project: "two-peaks", Stack: h.GetStackName(), Mocks: mocks})
+	}
+
+	type result struct {
+		resp *scpluginv1.ProvisionResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := p.Provision(context.Background(), twoPeaksRequest(t, nil, nil))
+		done <- result{resp, err}
+	}()
+
+	select {
+	case got := <-done:
+		Expect(got.err).To(MatchError(ContainSubstring("cannot set access bindings")))
+		Expect(got.resp).To(BeNil())
+	case <-time.After(30 * time.Second):
+		t.Fatal("Provision did not return after the engine refused the container: the await is parked on a rejected Output again")
+	}
 }
