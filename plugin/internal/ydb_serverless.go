@@ -80,7 +80,22 @@ func YdbServerless(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 		return nil, errors.Wrapf(err, "failed to create ydb-serverless %q", resName)
 	}
 
-	ctx.Export(toYdbFullEndpointExport(resName), db.YdbFullEndpoint)
+	// pulumi-yandex v1.1.0's generated YdbDatabaseServerless resource is
+	// missing `ydbFullEndpoint` + `ydbApiEndpoint` + `tlsEnabled` outputs —
+	// declared on the TypeScript type but never flowed from the underlying
+	// terraform provider, so the StringOutputs never resolve and any
+	// consumer's StackReference.GetOutputDetails returns a nil Value.
+	// Live-caught on astrofit provision 2026-11-15 (devops stack state
+	// showed every other output except these three).
+	//
+	// Construct the native gRPC endpoint from databasePath instead — that
+	// matches what `yc ydb database get` returns in its `endpoint` field
+	// (`grpcs://ydb.serverless.yandexcloud.net:2135/?database=<path>`) and
+	// is what the go-ydb / ydb-nodejs-sdk clients parse.
+	ydbFullEndpoint := db.DatabasePath.ApplyT(func(path string) string {
+		return fmt.Sprintf("grpcs://ydb.serverless.yandexcloud.net:2135/?database=%s", path)
+	}).(sdk.StringOutput)
+	ctx.Export(toYdbFullEndpointExport(resName), ydbFullEndpoint)
 	ctx.Export(toYdbDatabasePathExport(resName), db.DatabasePath)
 	ctx.Export(toYdbDatabaseIdExport(resName), db.ID())
 	ctx.Export(toYdbDocumentApiEndpointExport(resName), db.DocumentApiEndpoint)
