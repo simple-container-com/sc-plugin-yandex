@@ -810,24 +810,35 @@ func jsonRoundTrip(src any, out any) error {
 }
 
 // InitStateStore — pre-engine. The sidecar on SC core calls this and
-// uses the returned env vars + backend URL to configure the Pulumi
-// workspace. The plugin's own InitStateStore mutates process env
-// (AWS_* for SigV4), which is fine because SC core and the plugin
-// share the engine process via hashicorp/go-plugin.
+// consumes BOTH the returned env map (AWS_* for SigV4 signing of
+// Object Storage requests) AND the backend URL. The env map must
+// travel back over the proto: go-plugin runs the plugin in a
+// separate process, so any os.Setenv the driver did in-process
+// would never reach SC core's Pulumi invocation. Live-caught on
+// astrofit provision run 43735999751 (2026-11-15), where the first
+// S3 GetObject on `.pulumi/meta.yaml` fell through to EC2 IMDS.
 func (p *ycPlugin) InitStateStore(ctx context.Context, req *scpluginv1.InitStateStoreRequest) (*scpluginv1.InitStateStoreResponse, error) {
 	var cfg ycApi.StateStorageConfig
 	if err := decodeInputsAs(req.GetConfig(), &cfg); err != nil {
 		return nil, errors.Wrap(err, "decode state-storage config")
 	}
 	p.progress.Info("state-store", fmt.Sprintf("configuring yc-object-storage backend (bucket=%q region=%q)", cfg.BucketName, cfg.EffectiveRegion()))
-	if err := ycInternal.InitStateStore(ctx, &cfg, logger.New()); err != nil {
+	envMap, err := ycInternal.InitStateStore(ctx, &cfg, logger.New())
+	if err != nil {
 		p.progress.Error("state-store", fmt.Sprintf("init failed: %v", err))
 		return nil, err
 	}
-	// The driver already set AWS_* env vars in-process. Return the
-	// Pulumi backend URL so SC core's workspace points at the YC
-	// object-storage endpoint.
-	return &scpluginv1.InitStateStoreResponse{BackendUrl: cfg.StorageUrl()}, nil
+	env := make(map[string]*scpluginv1.InputValue, len(envMap))
+	for k, v := range envMap {
+		env[k] = &scpluginv1.InputValue{
+			Value:  &scpluginv1.InputValue_StringValue{StringValue: v},
+			Secret: k == "AWS_ACCESS_KEY_ID" || k == "AWS_SECRET_ACCESS_KEY",
+		}
+	}
+	return &scpluginv1.InitStateStoreResponse{
+		BackendUrl: cfg.StorageUrl(),
+		Env:        env,
+	}, nil
 }
 
 // decodeInputsAs lifts the plugin-bus input map into a typed Go value

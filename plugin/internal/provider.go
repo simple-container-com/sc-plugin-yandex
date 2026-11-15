@@ -5,19 +5,18 @@ package yandex
 
 import (
 	"context"
-	"os"
 
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/simple-container-com/api/pkg/api"
+	"github.com/simple-container-com/api/pkg/api/logger"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	// The Yandex provider SDK is our own bridge fork, so gci files it under the
 	// simple-container-com prefix rather than the pulumi one where every other
 	// provider SDK sits. That is correct output from .golangci.yml — longest
 	// prefix wins. Don't "fix" it by re-sectioning the lint config.
 	sdkYandex "github.com/simple-container-com/pulumi-yandex/sdk/go/yandex"
 
-	"github.com/simple-container-com/api/pkg/api"
-	"github.com/simple-container-com/api/pkg/api/logger"
-	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	yandex "github.com/simple-container-com/sc-plugin-yandex/api"
 )
 
@@ -35,17 +34,26 @@ import (
 // with a runner's AWS OIDC identity — and leaving the environment untouched would
 // hand the Yandex endpoint whatever AWS credentials happen to be exported, which
 // fails much later and much less legibly.
-func InitStateStore(ctx context.Context, stateStoreCfg api.StateStorageConfig, log logger.Logger) error {
+//
+// Returns the env map the caller must export BEFORE invoking Pulumi: in the
+// plugin binary this map rides back to SC core in
+// InitStateStoreResponse.env, and the sidecar on core does the actual
+// os.Setenv (plugin_sidecars.go makeStateStoreSidecar:50-56). A previous
+// implementation set the vars inside the plugin process, which is a no-op
+// because go-plugin runs the plugin as a separate process from SC core —
+// live-caught on astrofit provision 2026-11-15 (run 43735999751), where the
+// S3 GetObject on `.pulumi/meta.yaml` fell through to EC2 IMDS.
+func InitStateStore(ctx context.Context, stateStoreCfg api.StateStorageConfig, log logger.Logger) (map[string]string, error) {
 	var pcfg yandex.AccountConfig
 
 	log.Info(ctx, "Initializing yandex statestore...")
 
 	if err := api.ConvertAuth(stateStoreCfg, &pcfg); err != nil {
-		return errors.Wrapf(err, "failed to convert auth config to yandex.AccountConfig")
+		return nil, errors.Wrapf(err, "failed to convert auth config to yandex.AccountConfig")
 	}
 
 	if pcfg.AccessKey == "" || pcfg.SecretAccessKey == "" {
-		return errors.Errorf("yandex state storage requires a static access key pair " +
+		return nil, errors.Errorf("yandex state storage requires a static access key pair " +
 			"(accessKey/secretAccessKey); the service-account key alone cannot sign Object Storage requests")
 	}
 
@@ -53,18 +61,12 @@ func InitStateStore(ctx context.Context, stateStoreCfg api.StateStorageConfig, l
 	// the SDK reads no other variables. A process deploying both an AWS and a YC
 	// stack would clobber one with the other, which is why dual-cloud stacks are
 	// separate `sc deploy` invocations.
-	for name, value := range map[string]string{
+	return map[string]string{
 		"AWS_ACCESS_KEY_ID":     pcfg.AccessKey,
 		"AWS_SECRET_ACCESS_KEY": pcfg.SecretAccessKey,
 		"AWS_REGION":            pcfg.EffectiveRegion(),
 		"AWS_DEFAULT_REGION":    pcfg.EffectiveRegion(),
-	} {
-		if err := os.Setenv(name, value); err != nil {
-			return errors.Wrapf(err, "failed to set %s env variable", name)
-		}
-	}
-
-	return nil
+	}, nil
 }
 
 // Provider instantiates the Yandex Cloud Pulumi provider for one `${auth:...}`
