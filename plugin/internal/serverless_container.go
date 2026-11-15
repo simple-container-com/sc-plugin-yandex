@@ -182,6 +182,21 @@ func ServerlessContainer(ctx *sdk.Context, stack api.Stack, input api.ResourceIn
 	}
 	if serviceAccount != nil {
 		opts = append(opts, sdk.DependsOn([]sdk.Resource{serviceAccount}))
+		// Fire any post-processors parked for the container's SA — the hook
+		// yc-ydb-serverless's ComputeProcessor uses to emit a DB-scoped
+		// YdbDatabaseIamBinding against this SA. The onObject carries the ctx
+		// because the closure may need to create Pulumi resources in this pctx
+		// (the compute-process RPC's pctx is already closed by now).
+		saCtx := &ContainerServiceAccountCtx{
+			Ctx:           ctx,
+			SA:            serviceAccount,
+			ContainerName: containerName,
+			FolderID:      crInput.FolderID,
+			Opts:          opts,
+		}
+		if err := params.ComputeContext.RunPostProcessors(saCtx, saCtx); err != nil {
+			return nil, errors.Wrapf(err, "failed to run SA post-processors for serverless container %q", containerName)
+		}
 	}
 
 	// SECRETS — one Lockbox secret per stack holding every entry, referenced by

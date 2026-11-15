@@ -24,6 +24,7 @@ func TestProviderConfigsRegistered(t *testing.T) {
 		TemplateTypeYandexServerlessContainer,
 		ResourceTypeObjectStorageBucket,
 		ResourceTypeYandexContainerRegistry,
+		ResourceTypeYdbServerless,
 		RegistrarTypeYandexDns,
 	} {
 		Expect(registered).To(HaveKey(typ), "provider config %q must be registered", typ)

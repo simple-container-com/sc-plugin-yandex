@@ -110,12 +110,14 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 			ycApi.ResourceTypeObjectStorageBucket,
 			ycApi.ResourceTypeWildcardCert,
 			ycApi.ResourceTypeYandexContainerRegistry,
+			ycApi.ResourceTypeYdbServerless,
 			ycApi.TemplateTypeYandexServerlessContainer,
 			ycApi.TemplateTypeStaticWebsite,
 		},
 		ComputeProcessorTypes: []string{
 			ycApi.ResourceTypeObjectStorageBucket,
 			ycApi.ResourceTypeWildcardCert,
+			ycApi.ResourceTypeYdbServerless,
 		},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
@@ -382,6 +384,32 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.ResourceTypeWildcardCert:
 		return p.provisionWildcardCert(ctx, rctx.Pulumi, req, stack, stackParams)
+	case ycApi.ResourceTypeYdbServerless:
+		var ydb ycApi.YdbServerless
+		if err := decodeInputsAs(req.GetInputs(), &ydb); err != nil {
+			return nil, errors.Wrap(err, "decode ydb-serverless config")
+		}
+		provider, err := p.buildProvider(rctx.Pulumi, &ydb.AccountConfig, "ydb-serverless", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+		if err != nil {
+			return nil, err
+		}
+		input := api.ResourceInput{
+			Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &ydb}},
+			StackParams: stackParams,
+		}
+		p.progress.Info("ydb-serverless", fmt.Sprintf("provisioning ydb-serverless %q", req.GetResourceName()))
+		out, err := ycInternal.YdbServerless(rctx.Pulumi, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+		if err != nil {
+			p.progress.Error("ydb-serverless", fmt.Sprintf("ydb-serverless %q failed: %v", req.GetResourceName(), err))
+			return nil, err
+		}
+		urn, awaitErr := awaitComposite(ctx, out.Ref)
+		if awaitErr != nil {
+			p.progress.Error("ydb-serverless", fmt.Sprintf("ydb-serverless %q failed: %v", req.GetResourceName(), awaitErr))
+			return nil, awaitErr
+		}
+		p.progress.Info("ydb-serverless", fmt.Sprintf("ydb-serverless %q ready (urn=%s)", req.GetResourceName(), urn))
+		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 	case ycApi.TemplateTypeStaticWebsite:
 		return p.provisionStaticWebsite(ctx, rctx.Pulumi, req, stack, stackParams)
 	default:
@@ -633,6 +661,14 @@ func (p *ycPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputePr
 		input = runtime.ResourceInputForComputeProcess(req, parent, &cfg)
 		p.progress.Info("compute-process", fmt.Sprintf("compute-processing yc-wildcard-cert %q", req.GetResourceName()))
 		handler = ycInternal.WildcardCertComputeProcessor
+	case ycApi.ResourceTypeYdbServerless:
+		var ydb ycApi.YdbServerless
+		if err := decodeInputsAs(req.GetInputs(), &ydb); err != nil {
+			return nil, errors.Wrap(err, "decode ydb-serverless config for compute-process")
+		}
+		input = runtime.ResourceInputForComputeProcess(req, parent, &ydb)
+		p.progress.Info("compute-process", fmt.Sprintf("compute-processing ydb-serverless %q", req.GetResourceName()))
+		handler = ycInternal.YdbServerlessComputeProcessor
 	default:
 		return nil, errors.Errorf("yandex plugin does not advertise compute-processor for %q", req.GetResourceType())
 	}
@@ -888,6 +924,8 @@ func awaitComposite(ctx context.Context, ref any) (string, error) {
 		return awaitIDs(ctx, r.Bucket.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
 	case *ycInternal.ContainerRegistryOutput:
 		return awaitIDs(ctx, r.Registry.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
+	case *ycInternal.YdbServerlessOutput:
+		return awaitIDs(ctx, r.Database.ID())
 	case *ycInternal.ServerlessContainerOutput:
 		// Container is always present. Secret + SecretVersion only exist when
 		// the config carried secrets. Triggers are a slice — iterate and append IDs.
