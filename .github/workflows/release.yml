@@ -83,6 +83,12 @@ jobs:
           # does.
           GOMAXPROCS: '1'
           GOMEMLIMIT: '6GiB'
+          # GOGC=50 halves the heap-growth target before the GC kicks in.
+          # Trades build time for lower peak RSS — needed when newly-imported
+          # generated types (yc-ydb-serverless added at 551b996) pushed the
+          # compile unit just past the 6 GiB ceiling. Live-caught on run
+          # 43722045227 (linux-amd64 OOM-killed at 11:45 with exit 143).
+          GOGC: '50'
         run: |
           out=sc-plugin-yandex-${GOOS}-${GOARCH}
           go build -trimpath -buildvcs=false -p 1 \
