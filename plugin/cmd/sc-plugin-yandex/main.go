@@ -135,6 +135,15 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 		// boris290796-tech/astrofit deploy run 43818629507.
 		SafeToReplaceTypes: []string{
 			"yandex:index/lockboxSecretVersion:LockboxSecretVersion",
+			// A DNS recordset is a plain CNAME/ANAME/A row keyed by
+			// (zone, fqdn, type) that the yc-dns registrar re-materialises
+			// from the client stack's `domain:` on every apply. A rename
+			// (domain swap — e.g. app.astrofit.ru -> astrofit.ru) renames
+			// the Pulumi URN, triggering a destructive-delete-by-rename
+			// trip in SC's no-destroy invariant. Nothing to lose: the row
+			// comes right back under the new name on the same apply.
+			// Live-caught 2026-11-16 on astrofit deploy run 43935362282.
+			"yandex:index/dnsRecordset:DnsRecordset",
 		},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
