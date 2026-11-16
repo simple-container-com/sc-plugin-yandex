@@ -21,6 +21,7 @@ func init() {
 		ResourceTypeWildcardCert:              ReadWildcardCertConfig,
 		ResourceTypeYandexContainerRegistry:   ReadContainerRegistryConfig,
 		ResourceTypeYdbServerless:             ReadYdbServerlessConfig,
+		ResourceTypeSmartCaptcha:              ReadSmartCaptchaConfig,
 		RegistrarTypeYandexDns:                ReadRegistrarConfig,
 	})
 
@@ -58,6 +59,7 @@ func init() {
 			TemplateTypeStaticWebsite,             // "yc-static-website"
 			ResourceTypeYandexContainerRegistry,   // "yc-container-registry"
 			ResourceTypeYdbServerless,             // "yc-ydb-serverless"
+			ResourceTypeSmartCaptcha,              // "yc-smartcaptcha"
 			StateStorageTypeYandexObjectStorage,   // "yc-object-storage" (state backend)
 			SecretsProviderTypeYandexKms,          // "yc-kms" (secrets provider)
 			SecretsTypeYandexLockbox,              // "yc-lockbox" (runtime secret store)
