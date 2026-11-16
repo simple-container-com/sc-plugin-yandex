@@ -119,6 +119,22 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 			ycApi.ResourceTypeWildcardCert,
 			ycApi.ResourceTypeYdbServerless,
 		},
+		// Pulumi resource types whose content comes from the YAML config on
+		// every apply (no out-of-band writes) — SC's no-destroy invariant
+		// allows a REPLACE on these without the SC_ALLOW_DESTRUCTIVE_REPLACE
+		// override. A LockboxSecretVersion is immutable (its `entries` is
+		// create-once), and SC re-materialises it every apply from
+		// `client.yaml:secrets:` + any ComputeProcessor-injected secrets —
+		// so adding/removing a key always triggers REPLACE, and the data
+		// loss is nil (the previous version is retained by YC's secret
+		// version history; the new one carries the operator-intended set).
+		// Without this entry, any client stack that adds a new secret env
+		// (e.g. a fresh YDB_ENDPOINT via `uses:`) fails with
+		// 'input-driven destructive replace' — live-caught 2026-11-16 on
+		// boris290796-tech/astrofit deploy run 43818629507.
+		SafeToReplaceTypes: []string{
+			"yandex:index/lockboxSecretVersion:LockboxSecretVersion",
+		},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// simple-container-com/pulumi-yandex v1.1.0 — the static bridge over
 			// terraform-provider-yandex (pulumi/pulumi-yandex is archived at v0.13.0).
