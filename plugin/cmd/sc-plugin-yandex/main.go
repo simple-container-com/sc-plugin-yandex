@@ -111,6 +111,7 @@ func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpl
 			ycApi.ResourceTypeWildcardCert,
 			ycApi.ResourceTypeYandexContainerRegistry,
 			ycApi.ResourceTypeYdbServerless,
+			ycApi.ResourceTypeSmartCaptcha,
 			ycApi.TemplateTypeYandexServerlessContainer,
 			ycApi.TemplateTypeStaticWebsite,
 		},
@@ -439,6 +440,8 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 		}
 		p.progress.Info("ydb-serverless", fmt.Sprintf("ydb-serverless %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
 		return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
+	case ycApi.ResourceTypeSmartCaptcha:
+		return p.provisionSmartCaptcha(ctx, rctx.Pulumi, req, stack, stackParams)
 	case ycApi.TemplateTypeStaticWebsite:
 		return p.provisionStaticWebsite(ctx, rctx.Pulumi, req, stack, stackParams)
 	default:
@@ -479,6 +482,41 @@ func (p *ycPlugin) provisionWildcardCert(stdctx context.Context, pctx *sdk.Conte
 		return nil, errors.Wrap(err, "harvest yc-wildcard-cert exports")
 	}
 	p.progress.Info("wildcard-cert", fmt.Sprintf("yc-wildcard-cert %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
+	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
+}
+
+// provisionSmartCaptcha dispatches yc-smartcaptcha to its driver and returns
+// the harvested exports (captcha id, client key, server key as a secret) so SC
+// core re-exports them onto the parent stack root.
+func (p *ycPlugin) provisionSmartCaptcha(stdctx context.Context, pctx *sdk.Context, req *scpluginv1.ProvisionRequest, stack api.Stack, stackParams *api.StackParams) (*scpluginv1.ProvisionResponse, error) {
+	var cfg ycApi.SmartCaptcha
+	if err := decodeInputsAs(req.GetInputs(), &cfg); err != nil {
+		return nil, errors.Wrap(err, "decode yc-smartcaptcha config")
+	}
+	provider, err := p.buildProvider(pctx, &cfg.AccountConfig, "smartcaptcha", req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment(), req.GetResourceType(), req.GetResourceName())
+	if err != nil {
+		return nil, err
+	}
+	input := api.ResourceInput{
+		Descriptor:  &api.ResourceDescriptor{Type: req.GetResourceType(), Name: req.GetResourceName(), Config: api.Config{Config: &cfg}},
+		StackParams: stackParams,
+	}
+	p.progress.Info("smartcaptcha", fmt.Sprintf("provisioning yc-smartcaptcha %q (adopt=%t)", req.GetResourceName(), cfg.Adopt))
+	out, err := ycInternal.SmartCaptcha(pctx, stack, input, pApi.ProvisionParams{Log: logger.New(), Provider: provider})
+	if err != nil {
+		p.progress.Error("smartcaptcha", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
+	urn, err := awaitComposite(stdctx, out.Ref)
+	if err != nil {
+		p.progress.Error("smartcaptcha", fmt.Sprintf("%q failed: %v", req.GetResourceName(), err))
+		return nil, err
+	}
+	outputs, err := runtime.HarvestExports(stdctx, pctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "harvest yc-smartcaptcha exports")
+	}
+	p.progress.Info("smartcaptcha", fmt.Sprintf("yc-smartcaptcha %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
 	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
 }
 
@@ -966,6 +1004,8 @@ func awaitComposite(ctx context.Context, ref any) (string, error) {
 		return awaitIDs(ctx, r.Registry.ID(), r.ServiceAccount.ID(), r.AccessKey.ID(), r.RoleBinding.ID())
 	case *ycInternal.YdbServerlessOutput:
 		return awaitIDs(ctx, r.Database.ID())
+	case *ycInternal.SmartCaptchaOutput:
+		return awaitIDs(ctx, r.Captcha.ID())
 	case *ycInternal.ServerlessContainerOutput:
 		// Container is always present. Secret + SecretVersion only exist when
 		// the config carried secrets. Triggers are a slice — iterate and append IDs.
