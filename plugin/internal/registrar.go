@@ -26,6 +26,20 @@ type registrar struct {
 	// from zone because the lookup does not always put it in the same field.
 	zoneID string
 	log    logger.Logger
+	// certLookup is an optional lazy fallback for config.CertificateID — when
+	// unset in server.yaml, the registrar calls this with its zone name and
+	// gets back whatever cert id a sibling yc-wildcard-cert resource has
+	// provisioned for that zone in the current plugin process. Nil in the
+	// legacy path where the operator pins the id.
+	certLookup func(zone string) string
+}
+
+// SetCertLookup wires a lazy cert-id resolver onto an existing registrar.
+// main.go plumbs this in after the registrar is created so a later
+// yc-wildcard-cert Provision RPC can hand back its cert id without the
+// operator having to copy it into server.yaml.
+func (r *registrar) SetCertLookup(fn func(zone string) string) {
+	r.certLookup = fn
 }
 
 // Registrar resolves a Yandex Cloud DNS zone into something records can be written
@@ -193,12 +207,18 @@ func (r *registrar) NewRecord(ctx *sdk.Context, dnsRecord api.DnsRecord) (*api.R
 // credentials — not the service's. In a single-folder setup those are the same; they
 // would have to be split if a zone were ever shared across folders.
 func (r *registrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api.Stack, endpoint pApi.DomainEndpoint) (*api.ResourceOutput, error) {
-	if r.config.CertificateID == "" {
-		return nil, errors.Errorf("cannot publish %q: the %s registrar for zone %q needs `certificateId` — "+
-			"the id of a Certificate Manager certificate covering that domain, which the API Gateway terminates TLS with. "+
-			"A wildcard certificate for the zone covers every service; adopt it rather than issuing a second one, "+
-			"since a managed certificate validates at a single `_acme-challenge.%s` CNAME",
-			endpoint.Domain, yandex.RegistrarTypeYandexDns, r.config.ZoneName, r.config.ZoneName)
+	certID := r.config.CertificateID
+	if certID == "" && r.certLookup != nil {
+		certID = r.certLookup(r.config.ZoneName)
+	}
+	if certID == "" {
+		return nil, errors.Errorf("cannot publish %q: the %s registrar for zone %q has no cert — "+
+			"either set `certificateId:` on the registrar to an existing Certificate Manager id, "+
+			"OR declare a `yc-wildcard-cert` resource for zone %q in the SAME server.yaml and the "+
+			"registrar will pick its cert up automatically at API Gateway attach time. "+
+			"A managed wildcard validates at a single `_acme-challenge.%s` CNAME, which the "+
+			"yc-wildcard-cert resource provisions through THIS registrar.",
+			endpoint.Domain, yandex.RegistrarTypeYandexDns, r.config.ZoneName, r.config.ZoneName, r.config.ZoneName)
 	}
 	if !api.DomainInZone(endpoint.Domain, r.config.ZoneName) {
 		return nil, errors.Errorf("cannot publish %q: the %s registrar serves zone %q",
@@ -217,7 +237,7 @@ func (r *registrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api.Stack
 		CustomDomains: sdkYandex.ApiGatewayCustomDomainArray{
 			sdkYandex.ApiGatewayCustomDomainArgs{
 				Fqdn:          sdk.String(strings.TrimSuffix(endpoint.Domain, ".")),
-				CertificateId: sdk.String(r.config.CertificateID),
+				CertificateId: sdk.String(certID),
 			},
 		},
 	}, sdk.Provider(r.provider))

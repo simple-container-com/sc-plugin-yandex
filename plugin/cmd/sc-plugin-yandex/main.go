@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
@@ -54,7 +55,13 @@ type ycPlugin struct {
 	// simple-forge.ru), and a single slot let the last one initialised answer
 	// for a domain in the other's zone.
 	registrars []pApi.Registrar
-	progress   *scPlugin.Publisher
+	// certsByZone remembers the cert id a yc-wildcard-cert Provision RPC emitted,
+	// keyed by DNS zone name (e.g. "astrofit.ru"). A later ProvisionDomainForEndpoint
+	// RPC on a registrar whose own config carries no `certificateId:` falls back to
+	// this map — so operators never have to copy a Certificate Manager id into
+	// server.yaml. Populated by provisionWildcardCert; read by registrar in-engine.
+	certsByZone map[string]string
+	progress    *scPlugin.Publisher
 	// newPulumiContext, when set, replaces dialling the monitor named in the
 	// request header. Tests set it to open a context over Pulumi mocks, so a
 	// handler runs with the same context lifecycle it has live.
@@ -189,6 +196,14 @@ func (p *ycPlugin) provisionRegistrar(pctx *sdk.Context, req *scpluginv1.Provisi
 	if err != nil {
 		p.progress.Error("provision-registrar", "init failed: "+err.Error())
 		return nil, errors.Wrap(err, "init yandex registrar")
+	}
+	// Wire the lazy cert-id resolver: at ProvisionDomainForEndpoint time, if the
+	// registrar config has no `certificateId:`, fall back to whatever
+	// provisionWildcardCert cached for this zone. Lets operators omit the id
+	// from server.yaml entirely — declaring a yc-wildcard-cert resource for the
+	// same zone is sufficient.
+	if setter, ok := r.(interface{ SetCertLookup(func(string) string) }); ok {
+		setter.SetCertLookup(p.certIDForZone)
 	}
 	p.mu.Lock()
 	// Re-initialising a zone replaces its entry rather than adding a second one.
@@ -490,8 +505,40 @@ func (p *ycPlugin) provisionWildcardCert(stdctx context.Context, pctx *sdk.Conte
 	if err != nil {
 		return nil, errors.Wrap(err, "harvest yc-wildcard-cert exports")
 	}
+	// Remember the cert id for this zone so a sibling yc-dns registrar whose
+	// config carries no `certificateId:` can look it up at API Gateway attach
+	// time. Zero-ID server.yaml for the fleet-pure path: declare a
+	// yc-wildcard-cert for the zone and the registrar just uses it.
+	if cfg.ZoneName != "" {
+		zone := strings.TrimSuffix(cfg.ZoneName, ".")
+		for key, iv := range outputs {
+			if !strings.HasSuffix(key, "-wildcard-cert-id") {
+				continue
+			}
+			if id := iv.GetStringValue(); id != "" {
+				p.mu.Lock()
+				if p.certsByZone == nil {
+					p.certsByZone = map[string]string{}
+				}
+				p.certsByZone[zone] = id
+				p.mu.Unlock()
+				break
+			}
+		}
+	}
 	p.progress.Info("wildcard-cert", fmt.Sprintf("yc-wildcard-cert %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
 	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
+}
+
+// certIDForZone returns the cert id provisionWildcardCert cached for the zone
+// (or empty when no yc-wildcard-cert ran in this plugin process for it).
+func (p *ycPlugin) certIDForZone(zone string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.certsByZone == nil {
+		return ""
+	}
+	return p.certsByZone[strings.TrimSuffix(zone, ".")]
 }
 
 // provisionSmartCaptcha dispatches yc-smartcaptcha to its driver and returns
