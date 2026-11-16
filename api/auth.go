@@ -4,6 +4,7 @@
 package yandex
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 
@@ -60,6 +61,23 @@ type AccountConfig struct {
 	Zone            string `json:"zone,omitempty" yaml:"zone,omitempty"`
 
 	api.Credentials `json:",inline" yaml:",inline"`
+}
+
+// DeployServiceAccountID extracts the service_account_id from the authorized-key
+// JSON document in ServiceAccountKey. This is the deploy SA — the identity SC
+// authenticates to YC as. Empty when the AccountConfig has no key (e.g. relying
+// on YC metadata-service auth from within a VM).
+func (r *AccountConfig) DeployServiceAccountID() string {
+	if r.ServiceAccountKey == "" {
+		return ""
+	}
+	var parsed struct {
+		ServiceAccountID string `json:"service_account_id"`
+	}
+	if err := json.Unmarshal([]byte(r.ServiceAccountKey), &parsed); err != nil {
+		return ""
+	}
+	return parsed.ServiceAccountID
 }
 
 // EffectiveRegion resolves the configured region, falling back to DefaultRegion.

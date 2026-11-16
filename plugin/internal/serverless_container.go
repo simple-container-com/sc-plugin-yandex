@@ -425,6 +425,29 @@ func provisionContainerServiceAccount(
 	member := sa.ID().ToStringOutput().ApplyT(func(id string) string {
 		return fmt.Sprintf("serviceAccount:%s", id)
 	}).(sdk.StringOutput)
+
+	// YC's folder-level `admin` role does NOT automatically let a principal
+	// use (pass) every service account in that folder — `iam.serviceAccounts.user`
+	// is checked resource-by-resource on the SA itself. The deploy SA creating
+	// a FunctionTrigger with service_account_id=<this container SA> would
+	// otherwise fail with "Authentication problem: permission denied" (the
+	// trigger-dispatch path on astrofit's first deploy; the same would hit
+	// Function schedules, Container triggers, anywhere YC accepts
+	// `serviceAccountId` as an input). Grant it here. Additive member binding
+	// (…IamMember, not …IamBinding) so we don't clobber out-of-band grants
+	// the operator may have added.
+	if deployerSA := crInput.DeployServiceAccountID(); deployerSA != "" {
+		deployerMember := sdk.String(fmt.Sprintf("serviceAccount:%s", deployerSA)).ToStringOutput()
+		bindingName := fmt.Sprintf("%s-sa-user", containerName)
+		if _, err := sdkYandex.NewIamServiceAccountIamMember(ctx, bindingName, &sdkYandex.IamServiceAccountIamMemberArgs{
+			ServiceAccountId: sa.ID(),
+			Role:             sdk.String("iam.serviceAccounts.user"),
+			Member:           deployerMember,
+		}, append(opts, sdk.DependsOn([]sdk.Resource{sa}))...); err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to bind iam.serviceAccounts.user on %q for deploy SA", saName)
+		}
+	}
+
 	for _, role := range lo.Uniq(append(append([]string{}, DefaultContainerRoles...), extras.Roles...)) {
 		bindingName := fmt.Sprintf("%s-role-%s", containerName, strings.NewReplacer(".", "-", "_", "-").Replace(role))
 		// ResourcemanagerFolderIamMember is additive. ...FolderIamPolicy is
