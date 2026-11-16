@@ -10,11 +10,12 @@ import (
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/samber/lo"
-	sdkYandex "github.com/simple-container-com/pulumi-yandex/sdk/go/yandex"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
+
+	sdkYandex "github.com/simple-container-com/pulumi-yandex/sdk/go/yandex"
+
 	yandex "github.com/simple-container-com/sc-plugin-yandex/api"
 )
 
@@ -210,6 +211,19 @@ func (r *registrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api.Stack
 	certID := r.config.CertificateID
 	if certID == "" && r.certLookup != nil {
 		certID = r.certLookup(r.config.ZoneName)
+	}
+	// `certLookup` is populated only in the plugin PROCESS that provisioned
+	// the yc-wildcard-cert — a client-stack `sc deploy` spawns a fresh plugin
+	// and finds the map empty. Fall back to a live YC CM List call so the
+	// registrar always has a cert id when one exists in the folder for the
+	// zone. Lives in yc_cm_poll.go next to the live-status poller.
+	if certID == "" && r.config.ServiceAccountKey != "" {
+		if id, err := lookupCertByZoneLive(ctx.Context(), r.config.ServiceAccountKey, r.config.FolderID, r.config.ZoneName); err != nil {
+			r.log.Warn(ctx.Context(), "live CM cert lookup for zone %q failed: %v", r.config.ZoneName, err)
+		} else if id != "" {
+			r.log.Info(ctx.Context(), "live CM cert lookup for zone %q found cert %s", r.config.ZoneName, id)
+			certID = id
+		}
 	}
 	if certID == "" {
 		return nil, errors.Errorf("cannot publish %q: the %s registrar for zone %q has no cert — "+

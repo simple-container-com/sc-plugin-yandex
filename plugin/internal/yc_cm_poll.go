@@ -144,6 +144,65 @@ func getCertStatusLive(ctx context.Context, iamToken, certID string) (string, er
 	return cr.Status, nil
 }
 
+// lookupCertByZoneLive lists CM certificates in the folder and returns the
+// id of the one whose Domains cover <zone> + *.<zone> exactly. Used by the
+// yc-dns registrar as a cross-process fallback when the operator did not
+// pin `certificateId:` and the in-memory `certsByZone` map from the parent
+// provision is empty (a client-stack deploy spawns its own plugin process).
+// Returns ("", nil) when no matching cert exists — the caller renders its
+// usual "declare a yc-wildcard-cert resource" error.
+func lookupCertByZoneLive(ctx context.Context, keyJSON, folderID, zoneName string) (string, error) {
+	iam, err := mintIAMToken(ctx, keyJSON)
+	if err != nil {
+		return "", errors.Wrap(err, "mint IAM token for live cert lookup")
+	}
+	trimmed := strings.TrimSuffix(zoneName, ".")
+	wild := "*." + trimmed
+	url := "https://certificate-manager.api.cloud.yandex.net/certificate-manager/v1/certificates?folderId=" + folderID + "&pageSize=1000"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", errors.Wrap(err, "build CM ListCertificates request")
+	}
+	req.Header.Set("Authorization", "Bearer "+iam)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", errors.Wrap(err, "GET CM certificates")
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.Errorf("CM ListCertificates HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var lr struct {
+		Certificates []struct {
+			ID      string   `json:"id"`
+			Status  string   `json:"status"`
+			Domains []string `json:"domains"`
+		} `json:"certificates"`
+	}
+	if err := json.Unmarshal(b, &lr); err != nil {
+		return "", errors.Wrap(err, "decode CM ListCertificates response")
+	}
+	for _, c := range lr.Certificates {
+		if strings.ToUpper(c.Status) != "ISSUED" && strings.ToUpper(c.Status) != "RENEWING" {
+			continue
+		}
+		hasZone, hasWild := false, false
+		for _, d := range c.Domains {
+			switch strings.ToLower(strings.TrimSuffix(d, ".")) {
+			case strings.ToLower(trimmed):
+				hasZone = true
+			case strings.ToLower(wild):
+				hasWild = true
+			}
+		}
+		if hasZone && hasWild {
+			return c.ID, nil
+		}
+	}
+	return "", nil
+}
+
 // waitCertIssuedLive polls CM GetCertificate until the certificate is ISSUED
 // or RENEWING (both terminal for our purposes), or the timeout fires. Uses
 // live YC API — not Pulumi state — so a `same` preview whose state was
