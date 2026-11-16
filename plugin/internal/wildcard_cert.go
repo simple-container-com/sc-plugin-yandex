@@ -6,6 +6,7 @@ package yandex
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -135,31 +136,28 @@ func WildcardCert(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, pa
 	}
 	out.AcmeRecordset = acmeRecordset
 
-	// Wait for the cert to flip to ISSUED. The resource ApplyT below reads
-	// `cert.Status` and asserts; sdk.All ensures the recordset is created
-	// before the cert's status is read. Pulumi's engine then holds the
-	// top-level stack's progress until this chain resolves — the ApplyT
-	// cannot be dead-stripped because its output is used in the export
-	// below (ctx.Export forces evaluation; see trap 15 in the extraction
-	// playbook).
-	certID := sdk.All(cert.Status, cert.ID(), acmeRecordset.ID()).ApplyT(func(args []any) (string, error) {
-		status := args[0].(string)
-		id := args[1].(sdk.ID)
-		switch strings.ToUpper(status) {
-		case "ISSUED", "RENEWING":
-			params.Log.Info(ctx.Context(), "wildcard cert %q is %s (id=%s)", trimmed, status, id)
-			return string(id), nil
-		case "VALIDATING":
-			// Pulumi plan time; the ApplyT runs after the cert is created,
-			// which (per the SDK's resource lifecycle) is after YC's own
-			// wait-for-validation step. So VALIDATING here means CM is
-			// genuinely still validating — the DNS record likely has not
-			// propagated. Return nothing yet; the next refresh will retry.
-			return "", errors.Errorf("wildcard cert %q is still VALIDATING — check that the yc-dns registrar is live and that %s has propagated",
-				trimmed, "_acme-challenge."+trimmed)
-		default:
-			return "", errors.Errorf("wildcard cert %q is in unexpected state %q (want ISSUED)", trimmed, status)
+	// Wait for the cert to flip to ISSUED. We poll the YC CM API directly
+	// rather than reading `cert.Status` — on a `same` preview Pulumi returns
+	// the status that was cached in state at Create time, which is almost
+	// always VALIDATING (LE + CM round-trip is 60–90 s, longer with DNS
+	// propagation delay). Direct HTTP GET against /certificate-manager/v1
+	// with an IAM token minted from the SA key gives us the live status on
+	// every provision and makes the resource self-healing: a provision that
+	// landed state at VALIDATING flips to ISSUED on the very next run.
+	//
+	// sdk.All ensures the recordset is created before we even look up the
+	// cert id; Pulumi's engine holds the stack progress until this chain
+	// resolves because the output is consumed by ctx.Export below (trap 15
+	// in the extraction playbook — ApplyT must have a live consumer).
+	saKey := cfg.ServiceAccountKey
+	certID := sdk.All(cert.ID(), acmeRecordset.ID()).ApplyT(func(args []any) (string, error) {
+		id := args[0].(sdk.ID)
+		if err := waitCertIssuedLive(ctx.Context(), saKey, string(id), 15*time.Minute); err != nil {
+			return "", errors.Wrapf(err, "wildcard cert %q (id=%s) wait failed — check that the yc-dns registrar is live and that %s has propagated",
+				trimmed, id, "_acme-challenge."+trimmed)
 		}
+		params.Log.Info(ctx.Context(), "wildcard cert %q is ISSUED (id=%s)", trimmed, id)
+		return string(id), nil
 	}).(sdk.StringOutput)
 	out.CertificateID = certID
 
