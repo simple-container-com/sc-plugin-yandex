@@ -408,8 +408,21 @@ func (p *ycPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionReque
 			p.progress.Error("ydb-serverless", fmt.Sprintf("ydb-serverless %q failed: %v", req.GetResourceName(), awaitErr))
 			return nil, awaitErr
 		}
-		p.progress.Info("ydb-serverless", fmt.Sprintf("ydb-serverless %q ready (urn=%s)", req.GetResourceName(), urn))
-		return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+		// Harvest exports from the plugin's own pctx and return them on the
+		// RPC response so SC core re-exports them onto the parent stack
+		// root for `uses:` consumers. Without this, ctx.Export calls in
+		// the YDB provisioner land in the plugin pctx but are never
+		// collected by SC core's RunFunc — the parent stack's outputs
+		// never see astrofit-sc--prod-ydb-full-endpoint and the
+		// ComputeProcessor fails with "no plain value for output".
+		// Same mechanism the yc-wildcard-cert dispatch uses
+		// (provisionWildcardCert above, line 450).
+		outputs, err := runtime.HarvestExports(ctx, rctx.Pulumi)
+		if err != nil {
+			return nil, errors.Wrap(err, "harvest ydb-serverless exports")
+		}
+		p.progress.Info("ydb-serverless", fmt.Sprintf("ydb-serverless %q ready (urn=%s, %d output(s))", req.GetResourceName(), urn, len(outputs)))
+		return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: outputs}, nil
 	case ycApi.TemplateTypeStaticWebsite:
 		return p.provisionStaticWebsite(ctx, rctx.Pulumi, req, stack, stackParams)
 	default:
