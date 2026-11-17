@@ -90,7 +90,12 @@ func YdbServerless(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 	// on this provisioner. Stack outputs were missing ever since.
 	//
 	// Export the SDK fields directly.
-	ctx.Export(toYdbFullEndpointExport(resName), db.YdbFullEndpoint)
+	// YdbApiEndpoint is the bare gRPC host:port (e.g. grpcs://ydb.serverless.
+	// yandexcloud.net:2135) — correct for YDB_ENDPOINT. YdbFullEndpoint
+	// appends `/?database=<path>` which grpc-js (Node YDB SDK) rejects at
+	// DNS parse: "Failed to parse DNS address dns:...". Live-caught on
+	// astrofit signup 500 after migration to astrofit-sc--prod.
+	ctx.Export(toYdbFullEndpointExport(resName), db.YdbApiEndpoint)
 	ctx.Export(toYdbDatabasePathExport(resName), db.DatabasePath)
 	ctx.Export(toYdbDatabaseIdExport(resName), db.ID())
 	ctx.Export(toYdbDocumentApiEndpointExport(resName), db.DocumentApiEndpoint)
