@@ -12,7 +12,7 @@ require (
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
 	github.com/simple-container-com/api v0.0.0-20261115210614-efbb76d07974
-	github.com/simple-container-com/pulumi-yandex/sdk v1.1.1
+	github.com/simple-container-com/pulumi-yandex/sdk v1.1.2
 	github.com/simple-container-com/sc-plugin-yandex/api v0.0.0-20261101233310-67602079742f
 	github.com/spf13/afero v1.15.0
 	gopkg.in/yaml.v3 v3.0.1

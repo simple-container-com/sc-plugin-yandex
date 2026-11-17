@@ -288,6 +288,8 @@ github.com/simple-container-com/api v0.0.0-20261115210614-efbb76d07974 h1:8+MdT+
 github.com/simple-container-com/api v0.0.0-20261115210614-efbb76d07974/go.mod h1:BHezYLgfzDwf6PNZJwuQgnqSqIo7SwzhSivEy50CNoU=
 github.com/simple-container-com/pulumi-yandex/sdk v1.1.1 h1:pWsbtGDTzfCcnPmavgb5ChGm1mmgkUTty1PXYO0RkaM=
 github.com/simple-container-com/pulumi-yandex/sdk v1.1.1/go.mod h1:DYJQe2PUXFA1bZSrnc6g3zHxMDWMGqb2rF76GAhMzMQ=
+github.com/simple-container-com/pulumi-yandex/sdk v1.1.2 h1:YlNecqSI//MZ3QkRiS4BsX33Neym+amgZccKikjc4Pk=
+github.com/simple-container-com/pulumi-yandex/sdk v1.1.2/go.mod h1:DYJQe2PUXFA1bZSrnc6g3zHxMDWMGqb2rF76GAhMzMQ=
 github.com/sirupsen/logrus v1.7.0/go.mod h1:yWOB1SBYBC5VeMP7gHvWumXLIWorT60ONWic61uBYv0=
 github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w=
 github.com/sirupsen/logrus v1.9.4/go.mod h1:ftWc9WdOfJ0a92nsE2jF5u5ZwH8Bv2zdeOC42RjbV2g=
