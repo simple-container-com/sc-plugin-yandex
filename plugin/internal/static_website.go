@@ -61,8 +61,33 @@ func StaticWebsite(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 	}
 
 	certIDStr := cfg.CertificateID
-	if certIDStr == "" {
-		return nil, errors.Errorf("yc-static-website %q is missing certificateId — set `location: <yc-cm-cert-id>` on the client stack's `config:` block (the cert must cover %q + its base zone). The cert id of the parent's adopted wildcard cert lives in the yc-dns registrar config as `certificateId`.", input.Descriptor.Name, effectiveDomain)
+	// Resolve unresolved template interpolations or an operator-elided
+	// `location:` via a live YC CM List call: list certificates in the
+	// folder and match on domains==[zone,*.zone]. StackConfigStatic has no
+	// `uses:` field (api PR to add one is pending), so client.yaml's
+	// `location: ${resource:<name>.certificateId}` cannot reliably be
+	// resolved at template parse time — the compute-processor extension
+	// never fires on static stacks. Instead we auto-discover here, keeping
+	// the fleet-pure "zero cert ids in config" invariant this plugin has
+	// across the yc-dns registrar + yc-serverless-container paths.
+	if certIDStr == "" || strings.HasPrefix(certIDStr, "${") {
+		zone := cfg.EffectiveBaseDnsZone()
+		if zone == "" {
+			zone = effectiveDomain
+		}
+		if cfg.ServiceAccountKey == "" {
+			return nil, errors.Errorf("yc-static-website %q: no `location:` cert id AND no service-account key for live CM lookup (zone %q)", input.Descriptor.Name, zone)
+		}
+		id, lookupErr := lookupCertByZoneLive(ctx.Context(), cfg.ServiceAccountKey, cfg.FolderID, zone)
+		if lookupErr != nil {
+			return nil, errors.Wrapf(lookupErr, "yc-static-website %q: live CM cert lookup for zone %q failed", input.Descriptor.Name, zone)
+		}
+		if id == "" {
+			return nil, errors.Errorf("yc-static-website %q: no ISSUED wildcard cert covering [%q, %q] found in folder %q — either provision a yc-wildcard-cert for the zone on the parent, or set `location: <cert-id>` explicitly on the client stack",
+				input.Descriptor.Name, strings.TrimSuffix(zone, "."), "*."+strings.TrimSuffix(zone, "."), cfg.FolderID)
+		}
+		params.Log.Info(ctx.Context(), "yc-static-website %q: resolved cert id %q from live CM lookup for zone %q", input.Descriptor.Name, id, zone)
+		certIDStr = id
 	}
 
 	// Pulumi logical name (URN-anchored) — keeps slashes etc. for state
