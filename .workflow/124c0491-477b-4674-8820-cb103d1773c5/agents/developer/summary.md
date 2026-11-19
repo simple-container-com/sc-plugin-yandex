@@ -1,0 +1,1 @@
+`fqdn()` and `guardZoneInfrastructureRecord` are unchanged.
