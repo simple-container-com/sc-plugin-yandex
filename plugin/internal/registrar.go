@@ -5,6 +5,7 @@ package yandex
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -175,16 +176,34 @@ func (r *registrar) NewRecord(ctx *sdk.Context, dnsRecord api.DnsRecord) (*api.R
 	// record pointed at a bare cloud endpoint; on YC that job belongs to the edge
 	// ProvisionDomainForEndpoint creates, so a record is only ever a record.
 
-	recordset, err := sdkYandex.NewDnsRecordset(ctx, fmt.Sprintf("%s-recordset", dnsRecord.Name), &sdkYandex.DnsRecordsetArgs{
+	// A literal value may carry several newline-separated values (YAML `value: |`),
+	// all of which land in ONE recordset. A value that is a Pulumi Output (set by
+	// in-process callers such as ProvisionDomainForEndpoint) is always a single value.
+	var datas sdk.StringArray
+	if dnsRecord.Value != "" {
+		for _, v := range recordValues(dnsRecord.Type, dnsRecord.Value, dnsRecord.Priority) {
+			datas = append(datas, sdk.String(v))
+		}
+		if len(datas) == 0 {
+			return nil, errors.Errorf("record %q (%s) has no non-empty value", dnsRecord.Name, dnsRecord.Type)
+		}
+	} else {
+		datas = sdk.StringArray{value}
+	}
+
+	recordset, err := sdkYandex.NewDnsRecordset(ctx, recordsetResourceName(dnsRecord.Name, dnsRecord.Type), &sdkYandex.DnsRecordsetArgs{
 		ZoneId: sdk.String(r.zoneID),
-		Name:   sdk.String(fqdn(dnsRecord.Name)),
+		Name:   sdk.String(recordsetFqdn(dnsRecord.Name, r.config.ZoneName)),
 		Type:   sdk.String(dnsRecord.Type),
 		// One recordset holds every value for a name+type, so a multi-valued
 		// record is one resource here where Cloudflare needs N.
-		Datas: sdk.StringArray{value},
+		Datas: datas,
 		// Mandatory: there is no "automatic" sentinel to pass through.
 		Ttl: sdk.Int(r.config.EffectiveRecordTtl()),
-	}, sdk.Provider(r.provider))
+	}, sdk.Provider(r.provider),
+		// Stacks deployed before the type joined the resource name hold the recordset
+		// under the old name; without this alias Pulumi would delete and recreate it.
+		sdk.Aliases([]sdk.Alias{{Name: sdk.String(legacyRecordsetResourceName(dnsRecord.Name))}}))
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create recordset %q", dnsRecord.Name)
 	}
@@ -483,6 +502,64 @@ func fqdn(name string) string {
 		return name
 	}
 	return name + "."
+}
+
+// recordsetResourceName is the Pulumi resource name of a recordset. The type is part
+// of it because a name may hold several types (MX + TXT at the apex) and a name
+// without the type would collide as a duplicate URN.
+func recordsetResourceName(name, recordType string) string {
+	return fmt.Sprintf("%s-%s-recordset", name, strings.ToLower(recordType))
+}
+
+// legacyRecordsetResourceName is the name recordsets were registered under before the
+// type was added. It is kept as an alias so deployed stacks adopt, not recreate.
+func legacyRecordsetResourceName(name string) string {
+	return fmt.Sprintf("%s-recordset", name)
+}
+
+// recordsetFqdn resolves a record name to the absolute name YC DNS expects:
+//   - "@" or "" is the zone apex → "<zone>."
+//   - a name inside the zone (e.g. "app.astrofit.ru") → as given, plus a trailing dot
+//   - an absolute name (trailing dot) is kept as is
+//   - anything else is relative to the zone → "<name>.<zone>."
+func recordsetFqdn(name, zone string) string {
+	zone = strings.TrimSuffix(zone, ".")
+	switch {
+	case name == "@" || name == "":
+		return zone + "."
+	case strings.HasSuffix(name, "."), api.DomainInZone(name, zone), zone == "":
+		return fqdn(name)
+	default:
+		return name + "." + zone + "."
+	}
+}
+
+// priorityRecordTypes are the types whose data starts with a priority.
+var priorityRecordTypes = map[string]bool{"MX": true, "SRV": true, "URI": true}
+
+// recordValues splits a record's value into the entries of one recordset. Only
+// newlines separate values — spaces are part of a value (a TXT such as
+// "v=spf1 include:x ~all"). For MX/SRV/URI with a priority set, each value that does
+// not already start with an integer gets the priority prepended.
+func recordValues(recordType, value string, priority *int) []string {
+	var out []string
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if priority != nil && priorityRecordTypes[strings.ToUpper(recordType)] && !startsWithInteger(line) {
+			line = fmt.Sprintf("%d %s", *priority, line)
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func startsWithInteger(v string) bool {
+	first := strings.Fields(v)[0]
+	_, err := strconv.ParseUint(first, 10, 32)
+	return err == nil
 }
 
 // zoneInfrastructureRecordTypes are records the zone owns and a deploy must not

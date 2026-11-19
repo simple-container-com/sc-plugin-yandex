@@ -10,7 +10,9 @@ import (
 	"gopkg.in/yaml.v3"
 
 	. "github.com/onsi/gomega"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
+	"github.com/pkg/errors"
 	"github.com/simple-container-com/api/pkg/api"
 	sdkYandex "github.com/simple-container-com/pulumi-yandex/sdk/go/yandex"
 
@@ -320,4 +322,157 @@ func TestZoneIDOf(t *testing.T) {
 
 	_, err = zoneIDOf(&sdkYandex.LookupDnsZoneResult{Name: "simple-forge-ru"}, cfg)
 	Expect(err).To(MatchError(ContainSubstring("resolved without an id")))
+}
+
+const recordsetToken = "yandex:index/dnsRecordset:DnsRecordset"
+
+func TestRecordsetFqdn(t *testing.T) {
+	RegisterTestingT(t)
+
+	const zone = "astrofit.ru"
+	Expect(recordsetFqdn("@", zone)).To(Equal("astrofit.ru."))
+	Expect(recordsetFqdn("", zone)).To(Equal("astrofit.ru."))
+	Expect(recordsetFqdn("astrofit.ru", zone)).To(Equal("astrofit.ru."))
+	Expect(recordsetFqdn("app.astrofit.ru", zone)).To(Equal("app.astrofit.ru."))
+	Expect(recordsetFqdn("app.astrofit.ru.", zone)).To(Equal("app.astrofit.ru."))
+	Expect(recordsetFqdn("www", zone)).To(Equal("www.astrofit.ru."))
+	Expect(recordsetFqdn("@", "astrofit.ru.")).To(Equal("astrofit.ru."))
+	// A name that merely ends with the zone text is not inside it.
+	Expect(recordsetFqdn("notastrofit.ru", zone)).To(Equal("notastrofit.ru.astrofit.ru."))
+}
+
+func TestRecordValues(t *testing.T) {
+	RegisterTestingT(t)
+
+	ten, twenty := 10, 20
+	// Only newlines split; spaces inside a TXT value survive; blanks are skipped.
+	Expect(recordValues("TXT", "\n  v=spf1 include:spf.improvmx.com ~all  \n\n", nil)).
+		To(Equal([]string{"v=spf1 include:spf.improvmx.com ~all"}))
+	Expect(recordValues("MX", "mx1.improvmx.com.\nmx2.improvmx.com.\n", &ten)).
+		To(Equal([]string{"10 mx1.improvmx.com.", "10 mx2.improvmx.com."}))
+	// A leading integer is not duplicated, even with a different priority set.
+	Expect(recordValues("MX", "10 mx1.improvmx.com.\n20 mx2.improvmx.com.", &twenty)).
+		To(Equal([]string{"10 mx1.improvmx.com.", "20 mx2.improvmx.com."}))
+	Expect(recordValues("mx", "mx1.improvmx.com.", &ten)).To(Equal([]string{"10 mx1.improvmx.com."}))
+	Expect(recordValues("SRV", "5 5060 sip.example.com.", &ten)).To(Equal([]string{"5 5060 sip.example.com."}))
+	// Priority is ignored for other types, and absent priority leaves MX alone.
+	Expect(recordValues("TXT", "10 hello", &ten)).To(Equal([]string{"10 hello"}))
+	Expect(recordValues("CNAME", "target.example.com.", &ten)).To(Equal([]string{"target.example.com."}))
+	Expect(recordValues("MX", "mx1.improvmx.com.", nil)).To(Equal([]string{"mx1.improvmx.com."}))
+	Expect(recordValues("MX", " \n ", &ten)).To(BeEmpty())
+}
+
+func TestRecordsetResourceNames(t *testing.T) {
+	RegisterTestingT(t)
+
+	Expect(recordsetResourceName("@", "MX")).To(Equal("@-mx-recordset"))
+	Expect(recordsetResourceName("@", "TXT")).To(Equal("@-txt-recordset"))
+	Expect(legacyRecordsetResourceName("@")).To(Equal("@-recordset"))
+}
+
+// newTestRegistrar builds a registrar over the mocked provider, bypassing the zone
+// lookup that Registrar() does.
+func newTestRegistrar(ctx *pulumi.Context) (*registrar, error) {
+	params, err := bucketProvisionParams(ctx)
+	if err != nil {
+		return nil, err
+	}
+	prov, ok := params.Provider.(*sdkYandex.Provider)
+	if !ok {
+		return nil, errors.Errorf("provider is %T, not *sdkYandex.Provider", params.Provider)
+	}
+	return &registrar{
+		provider: prov,
+		config:   &yandex.RegistrarConfig{ZoneName: "astrofit.ru"},
+		zoneID:   "dns-zone-id",
+		log:      params.Log,
+	}, nil
+}
+
+func recordsetDatas(m *bucketMocks, name string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.created {
+		if a.TypeToken == recordsetToken && a.Name == name {
+			var out []string
+			for _, d := range a.Inputs["datas"].ArrayValue() {
+				out = append(out, d.StringValue())
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+func recordsetInputs(m *bucketMocks, name string) map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.created {
+		if a.TypeToken == recordsetToken && a.Name == name {
+			return map[string]string{"name": a.Inputs["name"].StringValue(), "type": a.Inputs["type"].StringValue()}
+		}
+	}
+	return nil
+}
+
+// TestNewRecord_MxAndTxtAtApexDoNotCollide is the regression for "Duplicate resource
+// URN ...DnsRecordset::@-recordset": MX and TXT on the same name are distinct resources,
+// "@" resolves to the zone, newline-separated MX values share ONE recordset, and the
+// priority is prepended.
+func TestNewRecord_MxAndTxtAtApexDoNotCollide(t *testing.T) {
+	RegisterTestingT(t)
+
+	mocks := newBucketMocks()
+	ten := 10
+	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
+		r, err := newTestRegistrar(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := r.NewRecord(ctx, api.DnsRecord{Name: "@", Type: "MX", Value: "mx1.improvmx.com.\n20 mx2.improvmx.com.\n", Priority: &ten}); err != nil {
+			return err
+		}
+		_, err = r.NewRecord(ctx, api.DnsRecord{Name: "@", Type: "TXT", Value: "v=spf1 include:spf.improvmx.com ~all"})
+		return err
+	}, pulumi.WithMocks("project", "stack", mocks))
+
+	Expect(err).To(BeNil())
+	Expect(mocks.countOf(recordsetToken)).To(Equal(2))
+
+	Expect(recordsetInputs(mocks, "@-mx-recordset")).To(Equal(map[string]string{"name": "astrofit.ru.", "type": "MX"}))
+	Expect(recordsetInputs(mocks, "@-txt-recordset")).To(Equal(map[string]string{"name": "astrofit.ru.", "type": "TXT"}))
+	// Two values, one recordset; priority prepended only where missing.
+	Expect(recordsetDatas(mocks, "@-mx-recordset")).To(Equal([]string{"10 mx1.improvmx.com.", "20 mx2.improvmx.com."}))
+	Expect(recordsetDatas(mocks, "@-txt-recordset")).To(Equal([]string{"v=spf1 include:spf.improvmx.com ~all"}))
+}
+
+// TestNewRecord_KeepsLegacyNameAsAlias: stacks already deployed hold the recordset
+// under "<name>-recordset"; the alias is what stops Pulumi recreating it.
+func TestNewRecord_KeepsLegacyNameAsAlias(t *testing.T) {
+	RegisterTestingT(t)
+
+	mocks := newBucketMocks()
+	err := pulumi.RunErr(func(ctx *pulumi.Context) error {
+		r, err := newTestRegistrar(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = r.NewRecord(ctx, api.DnsRecord{Name: "app.astrofit.ru", Type: "CNAME", Value: "gw.example.com."})
+		return err
+	}, pulumi.WithMocks("project", "stack", mocks))
+
+	Expect(err).To(BeNil())
+	Expect(recordsetInputs(mocks, "app.astrofit.ru-cname-recordset")).To(Equal(
+		map[string]string{"name": "app.astrofit.ru.", "type": "CNAME"}))
+
+	rpc := mocks.registerRPCOf(recordsetToken)
+	Expect(rpc).ToNot(BeNil())
+	Expect(rpc.GetName()).To(Equal("app.astrofit.ru-cname-recordset"))
+	// Depending on the SDK, aliases travel as structured Aliases or as pre-computed URNs.
+	var aliased []string
+	for _, a := range rpc.GetAliases() {
+		aliased = append(aliased, a.GetUrn()+a.GetSpec().GetName())
+	}
+	aliased = append(aliased, rpc.GetAliasURNs()...)
+	Expect(strings.Join(aliased, " ")).To(ContainSubstring("app.astrofit.ru-recordset"))
 }
