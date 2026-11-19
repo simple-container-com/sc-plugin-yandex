@@ -1,0 +1,47 @@
+{
+  "initialCharacterId": "developer",
+  "characters": [
+    {
+      "id": "developer",
+      "agentId": "6c6af8aa-8667-43b7-b0ae-93fbd6320a8e",
+      "displayName": "Developer",
+      "roleHint": "developer",
+      "capabilities": {
+        "hasDocker": true,
+        "hasPersistentDisk": true,
+        "maxTurnDurationSec": 0,
+        "supportsLongLived": true,
+        "isolation": "container",
+        "egressPolicy": "open"
+      },
+      "description": "Reads the repo CLAUDE.md first, then implements the change on a feature branch. Writes tests and runs go tests. Opens a PR with DCO-signed commits (git commit -s). No Co-Authored-By trailers and no claude.ai or Claude-Session links in commits or the PR. Never pushes to main and never merges."
+    },
+    {
+      "id": "analyst",
+      "agentId": "68668ff0-88e7-4cf9-810e-e0fe2f063709",
+      "displayName": "Analyst",
+      "roleHint": "code_reviewer",
+      "capabilities": {
+        "hasDocker": false,
+        "hasPersistentDisk": false,
+        "maxTurnDurationSec": 900,
+        "supportsLongLived": false,
+        "isolation": "microvm",
+        "egressPolicy": "open"
+      },
+      "description": "Reviewer. Reads the PR diff and checks it against the brief and CLAUDE.md. Checks backward compatibility (Pulumi aliases so existing resources are not replaced), that guard functions are untouched, test coverage, and commit hygiene (DCO sign-off, no Co-Authored-By, no claude.ai or Claude-Session links). Verdict: APPROVE or REQUEST_CHANGES with concrete findings. If REQUEST_CHANGES, send findings back to the Developer for a fix on the same branch (max 2 rounds). Does not merge and does not run live preview/provision; the operator does that locally afterwards."
+    }
+  ],
+  "transitions": [
+    {
+      "id": "t1",
+      "fromCharacterId": "developer",
+      "toCharacterId": "analyst",
+      "escalationPolicy": "operator_review",
+      "instructionsTemplate": "Hand over the opened PR (link, branch, summary of changes, test results) for review. The Developer must have read CLAUDE.md, used DCO-signed commits, and not pushed to main or merged."
+    }
+  ],
+  "managementAgentId": "analyst",
+  "enrichBudgetDefault": 2,
+  "storageMode": "shared"
+}
