@@ -226,12 +226,16 @@ func (p *ycPlugin) NewDnsRecord(ctx context.Context, req *scpluginv1.NewDnsRecor
 		return nil, errors.New("NewDnsRecord called before ProvisionRegistrar")
 	}
 	p.progress.Info("dns-record", fmt.Sprintf("creating %s record %q → %q", req.GetRecordType(), req.GetRecordName(), req.GetValueResolved()))
-	out, err := r.NewRecord(rctx.Pulumi, api.DnsRecord{
+	record := api.DnsRecord{
 		Name:    req.GetRecordName(),
 		Type:    req.GetRecordType(),
 		Value:   req.GetValueResolved(),
 		Proxied: req.GetProxied(),
-	})
+	}
+	if req.Priority != nil {
+		record.Priority = lo.ToPtr(int(req.GetPriority()))
+	}
+	out, err := r.NewRecord(rctx.Pulumi, record)
 	if err != nil {
 		p.progress.Error("dns-record", fmt.Sprintf("record %q failed: %v", req.GetRecordName(), err))
 		return nil, err
