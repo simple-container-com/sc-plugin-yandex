@@ -45,6 +45,20 @@ import (
 	ycInternal "github.com/simple-container-com/sc-plugin-yandex/plugin/internal"
 )
 
+// version is stamped by the release workflow via
+// `go build -ldflags "-X main.version=${VERSION}"`. The default `"dev"`
+// is what a local `make build` or a test run sees.
+//
+// Historically this field did not exist and PluginVersion below was
+// the literal `"yandex-0.0.3"` — a hand-bumped constant, which is
+// worse than the other four plugins' `0.0.1` because it LOOKS real.
+// An operator reading a provision log saw `vyandex-0.0.3` and reasonably
+// assumed someone had been incrementing it, when in fact every release
+// since the hand-bump reported the same stale value. See
+// sc-component-backup#38 for the fleet-wide context; roadmap item
+// `items/sc-plugin-version-stamp-missing-fleetwide.md`.
+var version = "dev"
+
 type ycPlugin struct {
 	scpluginv1.UnimplementedSCCloudPluginServer
 
@@ -101,7 +115,7 @@ func (p *ycPlugin) registrarFor(name string) pApi.Registrar {
 
 func (p *ycPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
-		PluginVersion:   "yandex-0.0.3",
+		PluginVersion:   "yandex-" + version,
 		StateStoreTypes: []string{ycApi.StateStorageTypeYandexObjectStorage},
 		// Intentionally NOT advertising ProviderTypes. The lifted yandex
 		// Provider.go names its pulumi:providers:yandex resource after
