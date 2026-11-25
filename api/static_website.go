@@ -9,12 +9,19 @@ import (
 )
 
 // TemplateTypeStaticWebsite is a per-stack template that deploys a static
-// site to Yandex Cloud: a public bucket, a CDN resource adopting the shared
-// wildcard cert, a DNS CNAME (ANAME at apex) via the plugin's own yc-dns
-// registrar, and a bundle sync via `local.NewCommand` + `aws s3 sync`
-// against YC's S3-compatible endpoint. One Pulumi resource per site
-// regardless of file count — see landing/infra/yc/main.tf for the
-// Terraform shape this mirrors.
+// site to Yandex Cloud: a public bucket, a DNS CNAME (ANAME at apex) via
+// the plugin's own yc-dns registrar, and a bundle sync via
+// `local.NewCommand` + `aws s3 sync` against YC's S3-compatible endpoint.
+//
+// By default the bucket terminates its OWN TLS (setHttpsConfig against the
+// shared wildcard cert), and no `yandex_cdn_resource` is provisioned. Opt
+// into a per-stack CDN with `cdn: { enabled: true }` when the site
+// genuinely needs edge caching — see the bucket-tls-addendum in forge:
+// docs/design/2026-11-02/yc-static-website-shared-cdn/bucket-tls-addendum.md
+// for why the default flipped and the cost trade. In short: each YC CDN
+// resource carries a prepaid ~150 GB + 100M-requests monthly package,
+// billed in full on CREATE day, re-billed on the 1st, non-pro-rated,
+// non-refundable. A landing serving kilobytes to humans pays for nothing.
 //
 // Why not one state entry per bundled file: the user has lived through
 // per-object Pulumi state bloat on a past project (staticapp.ru's
@@ -45,6 +52,22 @@ type StaticWebsiteTemplateConfig struct {
 	// ForceDestroy allows `sc destroy` to delete a bucket that still has
 	// objects. Defaults off.
 	ForceDestroy bool `json:"forceDestroy,omitempty" yaml:"forceDestroy,omitempty"`
+
+	// CDN is the optional edge-caching opt-in. Nil or `enabled: false`
+	// (the default) makes the bucket terminate TLS itself and provisions
+	// no `yandex_cdn_resource`. Set `enabled: true` to keep the legacy
+	// per-stack CDN shape — see the type doc above for the cost trade.
+	CDN *StaticWebsiteCDNConfig `json:"cdn,omitempty" yaml:"cdn,omitempty"`
+}
+
+// StaticWebsiteCDNConfig is the opt-in per-stack CDN block. A static stack
+// that genuinely needs edge caching sets `cdn: { enabled: true }` and pays
+// the ~150 RUB/month non-refundable package. Everyone else leaves it off
+// and the bucket terminates its own TLS.
+type StaticWebsiteCDNConfig struct {
+	// Enabled provisions a per-stack `yandex_cdn_resource` + origin group.
+	// Default false.
+	Enabled bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 }
 
 func ReadStaticWebsiteConfig(config *api.Config) (api.Config, error) {
@@ -65,10 +88,16 @@ type StaticWebsiteInput struct {
 	RedirectHttpToHttps *bool `json:"redirectHttpToHttps,omitempty" yaml:"redirectHttpToHttps,omitempty"`
 	ForceDestroy        bool  `json:"forceDestroy,omitempty" yaml:"forceDestroy,omitempty"`
 
+	// CDNEnabled is the top-level trap-6 mirror of CDN.Enabled. Clients
+	// NEVER author this; it's populated by ToStaticWebsiteConfig so the
+	// driver on the plugin side reads the opt-in even after the nested
+	// `CDN` field is dropped by SC core's JSON marshal.
+	CDNEnabled bool `json:"cdnEnabled,omitempty" yaml:"cdnEnabled,omitempty"`
+
 	// CertificateID is the YC Certificate Manager id of the wildcard cert
-	// this site's CDN resource attaches to. Clients populate it on the
-	// StackConfigStatic via a bucketName override (see
-	// ToStaticWebsiteConfig below for the field lift) because the
+	// this site's bucket (default) or CDN (`cdn.enabled: true`) binds to.
+	// Clients populate it on the StackConfigStatic via a Location override
+	// (see ToStaticWebsiteConfig below for the field lift) because the
 	// client.yaml's `type: static` schema has no cert field of its own
 	// and `uses:` isn't honored by the SC-core static-site deploy path.
 	//
@@ -79,6 +108,13 @@ type StaticWebsiteInput struct {
 	// `uses:` block, mirroring how the mongodb plugin's ComputeProcess
 	// shape works.
 	CertificateID string `json:"certificateId,omitempty" yaml:"certificateId,omitempty"`
+
+	// CDN is the opt-in per-stack CDN block (mirror of the template-tier
+	// field). Nil or Enabled=false uses the bucket-TLS path; Enabled=true
+	// provisions a per-stack yandex_cdn_resource. The driver reads
+	// EffectiveCDNEnabled() which also honours the CDNEnabled top-level
+	// trap-6 mirror.
+	CDN *StaticWebsiteCDNConfig `json:"cdn,omitempty" yaml:"cdn,omitempty"`
 
 	// Top-level mirrors of StackConfig.Site fields — the plugin bus's
 	// SC-core-side JSON marshal drops `Site` as a NAMED field with
@@ -187,6 +223,20 @@ func (i *StaticWebsiteInput) EffectiveRedirectHttpToHttps() bool {
 	return *i.RedirectHttpToHttps
 }
 
+// EffectiveCDNEnabled reports whether the opt-in per-stack CDN shape
+// applies. The trap-6 top-level `CDNEnabled` mirror wins; a direct caller
+// (local-plugin unit test) that only sets the nested `CDN` block is
+// honoured too. Defaults false — bucket-TLS path.
+func (i *StaticWebsiteInput) EffectiveCDNEnabled() bool {
+	if i.CDNEnabled {
+		return true
+	}
+	if i.CDN != nil {
+		return i.CDN.Enabled
+	}
+	return false
+}
+
 // ToStaticWebsiteConfig converts a `yc-static-website` template + a
 // StackConfigStatic client stack into the StaticWebsiteInput the
 // Provision RPC receives.
@@ -224,6 +274,10 @@ func ToStaticWebsiteConfig(tpl any, rootDir, stackName string, stackCfg *api.Sta
 	// pass the ClientDescriptor's `uses:` through, this can be replaced
 	// with a WildcardCertComputeProcessor-emitted env var.
 	certID := stackCfg.Location
+	cdnEnabled := false
+	if templateCfg.CDN != nil {
+		cdnEnabled = templateCfg.CDN.Enabled
+	}
 	return &StaticWebsiteInput{
 		AccountConfig:       templateCfg.AccountConfig,
 		EdgeCacheSettings:   templateCfg.EdgeCacheSettings,
@@ -232,6 +286,8 @@ func ToStaticWebsiteConfig(tpl any, rootDir, stackName string, stackCfg *api.Sta
 		RedirectHttpToHttps: templateCfg.RedirectHttpToHttps,
 		ForceDestroy:        templateCfg.ForceDestroy,
 		CertificateID:       certID,
+		CDN:                 templateCfg.CDN,
+		CDNEnabled:          cdnEnabled,
 		// Trap-6 workaround: populate top-level mirrors so the driver on
 		// the plugin side reads the real Site values even after the
 		// `Site` subtree is dropped by SC core's JSON marshal.
