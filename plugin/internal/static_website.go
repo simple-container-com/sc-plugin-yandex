@@ -307,9 +307,20 @@ func staticWebsiteBucketTLS(
 	// the bucket is actually serving its cert. The returned string is the
 	// CNAME target; `changed` is logged but not acted on (a re-bind would
 	// restart the ~30-minute edge propagation clock).
+	//
+	// Anchor the chain on sdk.All(bucket.ID(), bucket.Bucket), NOT on
+	// bucket.Bucket alone. bucket.Bucket is an echoed input (known at plan
+	// time) so Pulumi resolves it eagerly before the resource is created;
+	// an ApplyT on it fires immediately and the setHttpsConfig call lands
+	// against a bucket that does not exist yet (HTTP 404 "The specified
+	// bucket does not exist"). bucket.ID() is a resource-level output and
+	// only resolves after the bucket is live on YC, which is the
+	// dependency we actually want. Live-caught 2026-11-26 on the first
+	// sc-static-test smoke.
 	saKey := cfg.ServiceAccountKey
 	resName := input.Descriptor.Name
-	dnsTarget := bucket.Bucket.ApplyT(func(b string) (string, error) {
+	dnsTarget := sdk.All(bucket.ID(), bucket.Bucket).ApplyT(func(args []any) (string, error) {
+		b := args[1].(string)
 		iam, err := mintIAMTokenForStorage(ctx.Context(), saKey)
 		if err != nil {
 			return "", buildBucketHTTPSErrorContext(b, err)
