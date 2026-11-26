@@ -145,6 +145,25 @@ func StaticWebsite(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 			ErrorDocument: sdk.StringPtr(cfg.EffectiveErrorPage()),
 		},
 	}
+	// Bind the shared wildcard cert to the bucket so Object Storage terminates
+	// its own TLS. Only on the bucket-TLS path — the CDN path owns the cert at
+	// the CDN resource and the bucket should NOT also carry it (two owners of
+	// the same binding would thrash on every deploy).
+	//
+	// Why native StorageBucket.Https and not an out-of-band setHttpsConfig
+	// ApplyT: the pulumi-yandex provider's StorageBucket reads the bucket's
+	// HTTPS config on refresh and any field the program omits is treated as
+	// drift it must correct. Live-caught 2026-11-26 on simple-forge.ru's apex
+	// migration — my setHttpsConfig call set certificateId=fpqu9ukb7q53rmraipgs,
+	// Pulumi's next bucket-update stripped it the same deploy (the program
+	// didn't declare `https:`, so Pulumi deleted it), and the apex served no
+	// HTTPS until the operator re-POSTed setHttpsConfig manually. Declaring
+	// Https on the resource makes it the program's property instead of drift.
+	if !cfg.EffectiveCDNEnabled() {
+		bucketArgs.Https = &sdkYandex.StorageBucketHttpsArgs{
+			CertificateId: sdk.String(certIDStr),
+		}
+	}
 	bucket, err := sdkYandex.NewStorageBucket(ctx, bucketName, bucketArgs, append(opts, sdk.DependsOn([]sdk.Resource{roleBinding}))...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create bucket %q for yc-static-website", bucketName)
@@ -267,8 +286,8 @@ func StaticWebsite(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 }
 
 // staticWebsiteBucketTLS implements the default (no-CDN) path: the bucket
-// terminates its own TLS via setHttpsConfig against the shared wildcard
-// cert, and DNS points directly at <bucket>.website.yandexcloud.net.
+// declares its own TLS binding on the `Https` field against the shared
+// wildcard cert, and DNS points directly at <bucket>.website.yandexcloud.net.
 //
 // Why this path is the default: each `yandex_cdn_resource` carries a
 // prepaid ~150 GB + 100M-requests monthly package, charged in full on
@@ -280,10 +299,13 @@ func StaticWebsite(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 // stored as nil), so one shared CDN namespace poisons `/` across
 // tenants. See forge's `bucket-tls-addendum.md`.
 //
-// The HTTPS binding runs inside an ApplyT on bucket.Bucket so Pulumi
-// orders it after the bucket is Live. The ApplyT output is consumed by
-// the DNS record's ValueOut, which keeps the chain visible to Pulumi's
-// engine (trap 15: an ApplyT without a live consumer is dead-stripped).
+// The HTTPS binding is set declaratively on the bucket resource via
+// StorageBucketHttpsArgs (see where bucketArgs is built above). An
+// earlier revision of this driver bound HTTPS out-of-band via a
+// setHttpsConfig ApplyT; Pulumi's bucket refresh then saw the
+// certificateId in the YC state, the program didn't declare it, and
+// the next bucket-update stripped it — thrashing. Native Https field
+// gives Pulumi ownership so it stops deleting what we just set.
 //
 //nolint:revive // long signature is deliberate — reuses caller's resolved values
 func staticWebsiteBucketTLS(
@@ -291,57 +313,21 @@ func staticWebsiteBucketTLS(
 	_ api.Stack,
 	input api.ResourceInput,
 	params pApi.ProvisionParams,
-	cfg *yandex.StaticWebsiteInput,
+	_ *yandex.StaticWebsiteInput,
 	bucket *sdkYandex.StorageBucket,
 	sa *sdkYandex.IamServiceAccount,
 	accessKey *sdkYandex.IamServiceAccountStaticAccessKey,
-	siteName, domain, bucketName, websiteEndpoint, certIDStr string,
+	siteName, domain, bucketName, _, _ string,
 	_ []sdk.ResourceOption,
 ) (*api.ResourceOutput, error) {
-	if cfg.ServiceAccountKey == "" {
-		return nil, errors.Errorf("yc-static-website %q: bucket-TLS path requires ServiceAccountKey (IAM token for setHttpsConfig)", input.Descriptor.Name)
-	}
-
-	// Gate the DNS record on the bucket HTTPS binding completing. The
-	// ApplyT output drives DNS, so Pulumi will not emit the CNAME until
-	// the bucket is actually serving its cert. The returned string is the
-	// CNAME target; `changed` is logged but not acted on (a re-bind would
-	// restart the ~30-minute edge propagation clock).
-	//
-	// Anchor the chain on sdk.All(bucket.ID(), bucket.Bucket), NOT on
-	// bucket.Bucket alone. bucket.Bucket is an echoed input (known at plan
-	// time) so Pulumi resolves it eagerly before the resource is created;
-	// an ApplyT on it fires immediately and the setHttpsConfig call lands
-	// against a bucket that does not exist yet (HTTP 404 "The specified
-	// bucket does not exist"). bucket.ID() is a resource-level output and
-	// only resolves after the bucket is live on YC, which is the
-	// dependency we actually want. Live-caught 2026-11-26 on the first
-	// sc-static-test smoke.
-	saKey := cfg.ServiceAccountKey
 	resName := input.Descriptor.Name
-	dnsTarget := sdk.All(bucket.ID(), bucket.Bucket).ApplyT(func(args []any) (string, error) {
-		b := args[1].(string)
-		iam, err := mintIAMTokenForStorage(ctx.Context(), saKey)
-		if err != nil {
-			return "", buildBucketHTTPSErrorContext(b, err)
-		}
-		changed, err := ensureBucketHTTPS(ctx.Context(), iam, b, certIDStr)
-		if err != nil {
-			return "", buildBucketHTTPSErrorContext(b, err)
-		}
-		if changed {
-			params.Log.Info(ctx.Context(), "yc-static-website %q: bucket %q HTTPS bound to cert %q (fresh binding — up to 30 min to serve)", resName, b, certIDStr)
-		} else {
-			params.Log.Info(ctx.Context(), "yc-static-website %q: bucket %q HTTPS already bound to cert %q (no change)", resName, b, certIDStr)
-		}
-		return BucketWebsiteEndpoint(b), nil
-	}).(sdk.StringOutput)
+	websiteEndpoint := BucketWebsiteEndpoint(bucketName)
 
 	params.Log.Info(ctx.Context(), "configure DNS record for yc-static-website %q (domain %q) → bucket %s", resName, domain, websiteEndpoint)
 	record, err := params.Registrar.NewRecord(ctx, api.DnsRecord{
 		Name:     domain,
 		Type:     hostnameRecordType(domain, params.Registrar.MainDomain()),
-		ValueOut: dnsTarget,
+		ValueOut: sdk.String(websiteEndpoint).ToStringOutput(),
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to provision DNS record for yc-static-website %q (bucket-TLS)", input.Descriptor.Name)
@@ -349,9 +335,8 @@ func staticWebsiteBucketTLS(
 
 	ctx.Export(fmt.Sprintf("%s-static-website-domain", siteName), sdk.String(domain))
 	ctx.Export(fmt.Sprintf("%s-static-website-bucket", siteName), bucket.Bucket)
-	ctx.Export(fmt.Sprintf("%s-static-website-endpoint", siteName), dnsTarget)
+	ctx.Export(fmt.Sprintf("%s-static-website-endpoint", siteName), sdk.String(websiteEndpoint))
 	ctx.Export(fmt.Sprintf("%s-static-website-url", siteName), sdk.Sprintf("https://%s", domain))
-	_ = bucketName // kept for symmetry with the CDN branch; sync + bucket resources already reference it directly
 
 	return &api.ResourceOutput{
 		Ref: &StaticWebsiteOutput{
